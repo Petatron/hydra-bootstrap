@@ -94,7 +94,14 @@ machine classes.
 
 ## 4. Procedure
 
-### Phase A — Preconditions (no destructive action)
+### Phase A — Preconditions (non-disruptive only)
+
+> **Ordering correction 2026-08-21.** An earlier revision of this spec put the `br0` static-address
+> change and the containerd restart in Phase A. Both are wrong there. The workstation is still a
+> joined worker at `192.168.15.13`; moving it to `.10` changes the node's registered address
+> mid-cluster and breaks kubelet, Cilium, and node identity. Restarting containerd restarts every
+> pod on the node — including the debug pod that is currently the **only** access path to this host.
+> Both have moved to Phase B2, after teardown, where they are free.
 
 1. Confirm `192.168.15.10` is free and outside the router's DHCP pool. **Blocking** — D1 depends on it.
 2. Delete the leftover debug pod:
@@ -102,14 +109,52 @@ machine classes.
    kubectl get pods -A | grep node-debugger
    kubectl delete pod <name>
    ```
-3. Fix the netplan conflict. `50-cloud-init.yaml` currently re-enables DHCP on `br0`'s slave
-   interface and will race the bridge:
+3. Stop cloud-init from managing the network. This only writes files; it changes nothing live:
    ```bash
    sudo mv /etc/netplan/50-cloud-init.yaml /etc/netplan/50-cloud-init.yaml.disabled
    echo 'network: {config: disabled}' | sudo tee /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
    ```
-4. Rewrite `01-bridge.yaml` for the static address:
+   Do **not** run `netplan apply` yet — the bridge is still DHCP at this point, deliberately.
+4. Complete the non-disruptive part of the host prep the workstation never received (PET-34). None
+   of this touches networking or restarts containerd:
+   ```bash
+   printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf
+   sudo modprobe overlay br_netfilter
+   cat <<'EOF' | sudo tee /etc/sysctl.d/k8s.conf
+   net.bridge.bridge-nf-call-iptables  = 1
+   net.bridge.bridge-nf-call-ip6tables = 1
+   net.ipv4.ip_forward                 = 1
+   EOF
+   sudo sysctl --system
+   sudo apt-mark hold kubelet kubeadm kubectl
+   ```
+5. Verify `swapoff` is persistent: `swapon --show` must be empty and `/etc/fstab` free of swap.
+6. Confirm the tailnet ACL now permits SSH to the workstation. **Blocking** — see §6.
+
+### Phase B — Tear down (destructive; nothing runs on this cluster)
+
+```bash
+# On the XPS 13
+sudo kubeadm reset -f && sudo rm -rf /etc/cni/net.d ~/.kube
+
+# On the workstation
+sudo kubeadm reset -f && sudo rm -rf /etc/cni/net.d ~/.kube
+sudo iptables-save | grep -v -E "KUBE|CILIUM" | sudo iptables-restore
+```
+
+### Phase B2 — Disruptive host changes (only safe once the cluster is gone)
+
+Both of these were previously listed in Phase A, incorrectly.
+
+1. Fix the containerd cgroup driver and restart it. Safe now that no pods are running:
+   ```bash
+   sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+   sudo systemctl restart containerd
+   ```
+2. Move `br0` to the static address. This changes the host's address, so **do it only with a
+   confirmed independent way back in** (Tailscale SSH, per §6):
    ```yaml
+   # /etc/netplan/01-bridge.yaml
    network:
      version: 2
      renderer: networkd
@@ -123,34 +168,11 @@ machine classes.
          nameservers: {addresses: [192.168.15.1, 1.1.1.1]}
          parameters: {stp: false, forward-delay: 0}
    ```
-   `sudo netplan try` before `sudo netplan apply` — a mistake here costs you remote access.
-5. Complete the host prep the workstation never received (its original prep was a subset of
-   `bootstrap-control-plane.sh` — no persisted sysctl/modules, no `SystemdCgroup`, no version holds):
+   `sudo netplan try` (auto-reverts after 120 s) before `sudo netplan apply`.
+3. Confirm the new address and that `enp142s0` holds none of its own:
    ```bash
-   printf 'overlay\nbr_netfilter\n' | sudo tee /etc/modules-load.d/k8s.conf
-   sudo modprobe overlay br_netfilter
-   cat <<'EOF' | sudo tee /etc/sysctl.d/k8s.conf
-   net.bridge.bridge-nf-call-iptables  = 1
-   net.bridge.bridge-nf-call-ip6tables = 1
-   net.ipv4.ip_forward                 = 1
-   EOF
-   sudo sysctl --system
-   sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-   sudo systemctl restart containerd
-   sudo apt-mark hold kubelet kubeadm kubectl
+   ip -brief addr show br0 enp142s0
    ```
-6. Verify `swapoff` is persistent: `swapon --show` must be empty and `/etc/fstab` free of swap.
-
-### Phase B — Tear down (destructive; nothing runs on this cluster)
-
-```bash
-# On the XPS 13
-sudo kubeadm reset -f && sudo rm -rf /etc/cni/net.d ~/.kube
-
-# On the workstation
-sudo kubeadm reset -f && sudo rm -rf /etc/cni/net.d ~/.kube
-sudo iptables-save | grep -v -E "KUBE|CILIUM" | sudo iptables-restore
-```
 
 ### Phase C — Initialise the control plane on the workstation
 
