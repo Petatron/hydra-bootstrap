@@ -269,6 +269,39 @@ back. Worth fixing independently of Hydra; it is a standing latency tax on every
 - **Worker (workstation): unverified.** TCP 22 is **refused** from the control plane
   (`ssh: connect to host 192.168.15.13 port 22: Connection refused`), and the machine is not a
   Tailscale peer. There is no path from this session to inspect it.
+
+### How SSH access actually works (corrects an earlier assumption)
+
+Neither machine runs a conventional SSH server. On the control plane:
+
+- `systemctl is-active ssh sshd` -> `inactive` / `inactive`
+- nothing is listening on TCP 22
+- `/home/yibofu/.ssh` **does not exist** — no keys, no `authorized_keys`, no `known_hosts`
+
+Remote access works entirely through **Tailscale SSH** (`tailscale debug prefs` -> `"RunSSH": true`).
+Authentication is by tailnet identity, not by key or password.
+
+So the workstation refusing port 22 is **not a misconfiguration** — it is the same posture as the
+control plane. The difference is only that the control plane is a Tailscale node with SSH enabled
+and the workstation is not on the tailnet at all.
+
+The remedy is therefore to **add the workstation to the tailnet with SSH enabled**, not to install
+`openssh-server`. That matches the existing pattern, needs no key management, encrypts the
+inter-site link, and gives the host a stable address independent of the `192.168.15.0/24` DHCP
+range.
+
+**Design implication for PET-31.** Tailscale SSH authenticates human tailnet identities for
+interactive use; it is not a service-account transport. A `cluster-api-provider-hydra` controller
+running as a pod cannot readily use it for `qemu+ssh://`. That shifts the balance of the PET-31
+control-path decision:
+
+- *hostPath libvirt socket* (controller scheduled onto the hypervisor) needs no SSH transport at
+  all and becomes the path of least resistance for the first implementation.
+- *`qemu+ssh://`* would require standing up a conventional `sshd` with a dedicated keypair purely
+  for the provider — additional surface that Tailscale SSH was presumably adopted to avoid.
+
+Neither is precluded, but the assumption that "SSH already exists, so `qemu+ssh://` is the natural
+choice" does not hold here.
 - **No VMs exist in this cluster.** The worker is a **bare-metal** node, joined directly. No
   libvirt domain backs any Kubernetes node.
 
@@ -341,7 +374,9 @@ Blocked on access to the workstation (`192.168.15.13`), which refuses TCP 22:
 - [ ] libvirt / KVM present? IOMMU enabled? (`/dev/kvm`, `virsh version`, `dmesg | grep -i iommu`)
 - [ ] NVIDIA 5060 Ti driver binding — host `nvidia` driver vs `vfio-pci`
 - [ ] Host prep actually applied on the workstation vs the XPS 13
-- [ ] Reason sshd is closed, and the intended admin path to this host
+- [x] ~~Reason sshd is closed, and the intended admin path~~ — **answered**: no machine runs sshd;
+      access is via Tailscale SSH. The workstation simply is not on the tailnet.
+- [ ] Get the workstation onto the tailnet (`tailscale up --ssh`) so it is reachable at all to this host
 
 ~~Blocked on sudo on the control plane~~ — **resolved 2026-08-21**, passwordless sudo granted via
 `/etc/sudoers.d/yibofu-nopasswd`. Certificate expiry, static pod manifest inventory, certificate
