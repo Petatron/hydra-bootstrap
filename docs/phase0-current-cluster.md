@@ -2,9 +2,11 @@
 
 **Linear:** [PET-14 / BOOT-01](https://linear.app/petatron/issue/PET-14/boot-01-capture-the-current-manual-cluster-bootstrap-as-a-reproducible)
 **Captured:** 2026-08-20, from `ssh 100.116.30.60` (live cluster inspection)
-**Status:** control-plane/cluster facts verified, including root-only facts (captured 2026-08-21).
-Original `kubeadm init` command **recovered**. Hypervisor-host facts still **pending host access**
-(see [Open items](#open-items)).
+**Status:** both hosts inspected. Control-plane facts verified 2026-08-20/21; workstation facts
+verified 2026-08-21 via a privileged Kubernetes debug pod. Original `kubeadm init` **recovered**.
+
+> **Several earlier entries in this document were wrong and have been corrected in place.** See
+> [Corrections](#corrections) for what changed and why it matters.
 
 This document records the cluster as it actually exists, not as the repos describe it. Where the
 two disagree, reality is recorded and the drift is listed in [Drift](#drift-repos-vs-reality).
@@ -16,13 +18,19 @@ two disagree, reality is recorded and the drift is listed in [Drift](#drift-repo
 | | Control plane | Worker |
 |---|---|---|
 | K8s node name | `hlcluster-ctrlr0` | `hycluster-worker-0` |
-| Hardware | Dell XPS 13 | Workstation |
-| Node IP | `192.168.16.10` | `192.168.15.13` |
-| CPU / Memory | 8 vCPU / 15 GiB | 48 vCPU / 125 GiB |
+| Hardware | Dell XPS 13 | Custom workstation |
+| CPU | 8 vCPU | **AMD Ryzen Threadripper 7960X**, 24C / 48T |
+| Memory | 15 GiB | 125 GiB |
+| Node IP | `192.168.16.10` (DHCP, USB NIC) | `192.168.15.13` (DHCP, on `br0`) |
+| Tailscale | `100.116.30.60` | `100.100.51.95` (as `hycluster-worker-0-1`) |
 | Ephemeral storage | 468 GiB | 915 GiB |
 | Roles | `control-plane` | *(none)* |
 | Taints | `node-role.kubernetes.io/control-plane:NoSchedule` | none |
-| `/dev/kvm` | **absent** | unverified |
+| `/dev/kvm` | **absent** | **present** |
+| Virtualization | none exposed | **AMD-V**, `kvm_amd` loaded |
+| IOMMU | not checked | **enabled**, 51 groups |
+| GPUs | none | **3 × NVIDIA `10de:2d04`** |
+| libvirt | not installed | **already installed** (12 pkgs, `virsh`, `qemu-system-x86_64`) |
 
 Both nodes: Ubuntu 24.04.4 LTS, kernel 6.17.0-20-generic, containerd 2.2.1, kubelet v1.35.3.
 Cluster age at capture: 128 days. Single-node etcd, single control plane (no HA).
@@ -197,9 +205,45 @@ sudo bash ~/install-cilium.sh          # -> `cilium install` (CLI, not Helm)
 kubeadm token create --print-join-command
 ```
 
-The worker was joined with the output of that last command — a standard token-based
-`kubeadm join <endpoint> --token <t> --discovery-token-ca-cert-hash sha256:<h>`. The literal token
-and hash are not recorded and are irrelevant (tokens expire after 24h by default).
+### Worker join — recovered, and it points at a different control-plane address
+
+The workstation's shell history contains the actual join, repeated across several retries:
+
+```bash
+sudo swapoff -a
+sudo apt-get install -y containerd
+sudo systemctl enable --now containerd
+sudo modprobe br_netfilter
+sudo kubeadm join 192.168.15.10:6443 --token <redacted> \
+  --discovery-token-ca-cert-hash sha256:<redacted>
+```
+
+(The token is long expired — kubeadm tokens default to 24h — and the CA hash is a public key
+fingerprint, so neither is sensitive. Both are nonetheless left out of this document.)
+
+**The endpoint is `192.168.15.10`, not `192.168.16.10`.** That is the workstation's own `/24`.
+
+The current cluster's API server advertises `192.168.16.10`, the recovered `kubeadm init` used
+`192.168.16.10`, and the serving certificate's SANs contain `192.168.16.10` — so the *running*
+cluster is consistent. But the join history, together with
+`hydra-infra/terraform.tfvars.example`'s `control_plane_ip = "192.168.15.10"`, is evidence that at
+some point the control plane sat at `192.168.15.10`, on the **same subnet as the workstation**.
+
+Two readings, not yet distinguished:
+
+1. **The control plane moved networks.** The XPS 13 was originally on `192.168.15.0/24` alongside
+   the workstation, and later moved behind a different router to `192.168.16.0/27`. Under this
+   reading the ~30 ms inter-site hop is a **regression**, not an original design choice, and the
+   `hydra-infra` tfvars was *correct when written*.
+2. **These are remnants of an earlier, discarded cluster** at `192.168.15.10`, and the current
+   cluster was always at `192.168.16.10`.
+
+Distinguishing them requires reading `/etc/kubernetes/kubelet.conf` on the workstation to see which
+endpoint its kubelet actually uses today. **Unresolved** — see [Open items](#open-items).
+
+Either way it strengthens the case for relocating the control plane onto the workstation: reading 1
+makes it a restoration of the original topology; reading 2 makes it the layout that was intended
+before the laptop was chosen.
 
 **This explains the pod-subnet mismatch.** `kubeadm init` was correctly given
 `--pod-network-cidr=10.244.0.0/16`, but `cilium install` does not read kubeadm's `podSubnet` — it
@@ -265,45 +309,76 @@ back. Worth fixing independently of Hydra; it is a standing latency tax on every
 ## 6. Virtualization state
 
 - **Control plane (XPS 13): cannot host VMs.** `/dev/kvm` does not exist and `virsh` is not
-  installed. `~/vms/` (referenced by the `hydra-infra` README) does not exist.
-- **Worker (workstation): unverified.** TCP 22 is **refused** from the control plane
-  (`ssh: connect to host 192.168.15.13 port 22: Connection refused`), and the machine is not a
-  Tailscale peer. There is no path from this session to inspect it.
+  installed. `~/vms/` does not exist.
+- **Workstation: already a working libvirt host.** This corrects the earlier "unverified" entry.
 
-### How SSH access actually works (corrects an earlier assumption)
+### Workstation virtualization — verified 2026-08-21
 
-Neither machine runs a conventional SSH server. On the control plane:
+| Check | Result |
+|---|---|
+| CPU | AMD Ryzen Threadripper 7960X, 24 cores / 48 threads, 1 socket |
+| Virtualization | `AMD-V`; `vmx\|svm` flag on all 48 threads |
+| `/dev/kvm` | `crw-rw----+ 1 root kvm 10, 232` — present |
+| Kernel modules | `kvm_amd` (241664) and `kvm` (1445888) loaded |
+| IOMMU | enabled — `iommu: Default domain type: Translated`, AMD-Vi counters, **51 groups** |
+| libvirt/qemu | **installed** — 12 matching packages, `/usr/bin/virsh`, `/usr/bin/qemu-system-x86_64` |
+| `virbr0` | exists at `192.168.122.1/24`, currently DOWN (default libvirt network, unused) |
+| `br0` | **exists and UP**, `192.168.15.13/24` — this is the node's own address |
 
-- `systemctl is-active ssh sshd` -> `inactive` / `inactive`
-- nothing is listening on TCP 22
-- `/home/yibofu/.ssh` **does not exist** — no keys, no `authorized_keys`, no `known_hosts`
+**No firmware work is required.** Virtualization and IOMMU are already on, KVM is loaded, and the
+hypervisor stack is already installed. The `br0` bridge that `hydra-infra` expects already exists.
 
-Remote access works entirely through **Tailscale SSH** (`tailscale debug prefs` -> `"RunSSH": true`).
-Authentication is by tailnet identity, not by key or password.
+### GPUs — three, not one
 
-So the workstation refusing port 22 is **not a misconfiguration** — it is the same posture as the
-control plane. The difference is only that the control plane is a Tailscale node with SSH enabled
-and the workstation is not on the tailnet at all.
+Three identical NVIDIA cards (`10de:2d04`, consistent with RTX 5060 Ti), on separate root ports:
 
-The remedy is therefore to **add the workstation to the tailnet with SSH enabled**, not to install
-`openssh-server`. That matches the existing pattern, needs no key management, encrypts the
-inter-site link, and gives the host a stable address independent of the `192.168.15.0/24` DHCP
-range.
+| PCI address | Subsystem | Driver in use |
+|---|---|---|
+| `01:00.0` | Gigabyte `1458:418f` | `nvidia` |
+| `21:00.0` | ZOTAC `19da:1772` | `nvidia` |
+| `c1:00.0` | Gigabyte `1458:418f` | `nvidia` |
 
-**Design implication for PET-31.** Tailscale SSH authenticates human tailnet identities for
-interactive use; it is not a service-account transport. A `cluster-api-provider-hydra` controller
-running as a pod cannot readily use it for `qemu+ssh://`. That shifts the balance of the PET-31
-control-path decision:
+Each has a companion HDMI audio function (`10de:22eb`) bound to `snd_hda_intel`. All three GPUs are
+currently held by the host `nvidia` driver, and Kubernetes shows no `nvidia.com/gpu` resource
+because no device plugin is installed.
 
-- *hostPath libvirt socket* (controller scheduled onto the hypervisor) needs no SSH transport at
-  all and becomes the path of least resistance for the first implementation.
-- *`qemu+ssh://`* would require standing up a conventional `sshd` with a dedicated keypair purely
-  for the provider — additional surface that Tailscale SSH was presumably adopted to avoid.
+**This invalidates the single-GPU premise of ADR-004** — see [Corrections](#corrections).
 
-Neither is precluded, but the assumption that "SSH already exists, so `qemu+ssh://` is the natural
-choice" does not hold here.
-- **No VMs exist in this cluster.** The worker is a **bare-metal** node, joined directly. No
-  libvirt domain backs any Kubernetes node.
+### Network configuration
+
+```
+enp141s0   DOWN                      (spare 1/10GbE)
+enp142s0   UP     (enslaved to br0)
+wlp143s0   DOWN                      (spare Wi-Fi)
+br0        UP     192.168.15.13/24   default via 192.168.15.1, proto dhcp
+virbr0     DOWN   192.168.122.1/24
+tailscale0 UNKNOWN 100.100.51.95/32
+```
+
+Netplan has **two files that conflict**:
+
+- `/etc/netplan/01-bridge.yaml` — `enp142s0: {dhcp4: no}`, `br0: {interfaces: [enp142s0], dhcp4: yes}`
+- `/etc/netplan/50-cloud-init.yaml` — `enp142s0: {dhcp4: true}`
+
+Netplan merges by ascending filename, so `50-cloud-init.yaml` wins and re-enables DHCP directly on
+the bridge's slave interface. That is a latent fault: `enp142s0` may acquire its own lease
+alongside `br0`. The cloud-init file should be neutralised rather than left to race.
+
+Two spare interfaces are available (`enp141s0`, `wlp143s0`), which matters for giving a relocated
+control plane a dedicated static address without disturbing `br0`.
+
+### Firewall — not the cause of the SSH block
+
+`ufw` is **inactive**; `iptables -L INPUT` policy is **ACCEPT**, with only the expected
+`CILIUM_INPUT`, `ts-input`, and `KUBE-*` chains. Nothing on the host blocks TCP 22.
+
+Combined with the earlier probes — `tailscale ping` succeeds (35 ms, direct), TCP 22 over the
+tailnet times out silently, TCP 22 over the LAN is refused — the SSH block is in the **tailnet
+access policy**, not on the host. The host has no `sshd` at all (consistent with the control
+plane), so the LAN refusal is expected; the tailnet-side silent drop is an ACL denial.
+
+The device was previously registered as `hycluster-worker-0` and had fallen out of the tailnet; it
+re-registered as `hycluster-worker-0-1`, so any ACL rule naming the old hostname no longer matches.
 
 ### Implication for ADR-002
 
@@ -327,14 +402,16 @@ moving it off the critical path ahead of PET-9.
 | 3 | `bootstrap-control-plane.sh`: suggests **Flannel** | **Cilium** 1.19.1 |
 | 4 | `hydra-infra` README: Terraform + `sync-nodes.sh` manage worker VMs | No VMs; the one worker is bare metal, joined manually |
 | 5 | `hydra-infra` README: "see `~/vms/setup-host.sh`" | Path does not exist on the control plane |
-| 6 | `hydra-infra` `terraform.tfvars.example`: `control_plane_ip = "192.168.15.10"` | Control plane is `192.168.16.10`, in a **different** `/27` |
+| 6 | `hydra-infra` `terraform.tfvars.example`: `control_plane_ip = "192.168.15.10"` | Control plane is `192.168.16.10`. **Revised:** the worker's join history also references `192.168.15.10`, so this was likely accurate when written rather than wrong — see the join section |
 | 7 | `hydra-infra` `versions.tf`: `provider libvirt { uri = "qemu:///system" }` | Implies Terraform runs *on* the libvirt host; no libvirt host is configured |
-| 8 | `hydra-infra` expects bridge `br0`, image at `/home/yibofu/vms/images/...` | Neither present on the control plane |
+| 8 | `hydra-infra` expects bridge `br0`, image at `/home/yibofu/vms/images/...` | **Revised:** `br0` **does exist** on the workstation (`192.168.15.13/24`, UP). Only the control plane lacks it — the tfvars was written against the workstation, where it is correct |
 | 9 | `hydra-gitops`: 10 manifests (Argo CD, Cilium, KEDA, MetalLB, local-path) | **Nothing deployed**; no `argocd` namespace |
 | 10 | `hydra-gitops` app-of-apps owns Cilium | Cilium installed imperatively via `cilium install` CLI |
 
 Items 6–8 together indicate `terraform.tfvars.example` was written for a topology in which the
-control plane sits in `192.168.15.0/24` alongside the workstation. That is not the current layout.
+control plane sits in `192.168.15.0/24` alongside the workstation, and was intended to run **on the
+workstation**. The worker's recovered join command corroborates that such a topology existed. It is
+not the current layout, but the file is better read as *stale relative to a move* than as wrong.
 
 ---
 
@@ -367,13 +444,50 @@ reconstructed from observed state. It is **not** met for the worker's host prepa
 
 ---
 
+## Corrections
+
+Entries in earlier revisions of this document that turned out to be wrong, and what replaced them.
+
+| # | Earlier claim | Corrected finding | Why it matters |
+|---|---|---|---|
+| 1 | The workstation's virtualization state is unverified; PET-31 must verify or enable KVM and install libvirt | **Already done.** AMD-V on, IOMMU on, `kvm_amd` loaded, `/dev/kvm` present, libvirt and qemu installed, `br0` up | PET-31's scope shrinks to resource partitioning, a storage pool, base image, and the control-path decision. No firmware or install work. |
+| 2 | A **single** NVIDIA 5060 Ti, so GPU passthrough is all-or-nothing and a GPU pool caps at `max: 1` | **Three** identical NVIDIA `10de:2d04` cards on separate root ports (`01:00.0`, `21:00.0`, `c1:00.0`) | Invalidates the core premise of ADR-004 and PET-33. See below. |
+| 3 | The original `kubeadm init` and `join` commands are lost to shell history | Both **recovered** — `init` from the control plane's root history and the systemd journal, `join` from the workstation's history | PET-14's reproducibility criterion is met from records, not reconstruction. |
+| 4 | Certificate expiry ≈ 237 days (estimated) | **2027-04-14**, 235 days; CAs 2036-04-11 (measured) | Renewal is one event, all leaf certs share a date. |
+| 5 | `hydra-infra`'s `control_plane_ip` and `br0` assumptions are drift/wrong | Both were likely **correct when written**; `br0` exists on the workstation and the join history references `192.168.15.10` | The repo is stale relative to a topology *change*, not built on false assumptions. |
+| 6 | The workstation "refuses SSH", implying a misconfiguration | Neither host runs `sshd`; access is Tailscale SSH. The block is a **tailnet ACL**, confirmed by `ufw` inactive and `iptables` INPUT ACCEPT | Fix is in the Tailscale admin console, not on the host. |
+
+### ADR-004 must be rewritten
+
+The three-GPU finding changes the available options qualitatively, not just quantitatively:
+
+- **Host and VMs can coexist.** One or two cards can be bound to `vfio-pci` for guests while the
+  remaining card stays on the host `nvidia` driver. The earlier "the host loses the GPU entirely"
+  trade-off does not apply.
+- **A GPU node pool can genuinely scale.** `min: 0, max: 2` (keeping one card on the host) or
+  `max: 3` is a real autoscaling demonstration, not a one-node token.
+- **Still out of reach:** "multiple GPU classes" (all three cards are the same model), vGPU
+  (consumer silicon), and MIG (datacenter-only). Those roadmap items still need different hardware.
+- **New prerequisite:** passthrough requires each GPU in its **own** IOMMU group. 51 groups on a
+  Threadripper platform is promising but **unverified per-device**. This must be checked before
+  ADR-004 can be decided.
+
 ## Open items
 
 Blocked on access to the workstation (`192.168.15.13`), which refuses TCP 22:
 
-- [ ] libvirt / KVM present? IOMMU enabled? (`/dev/kvm`, `virsh version`, `dmesg | grep -i iommu`)
-- [ ] NVIDIA 5060 Ti driver binding — host `nvidia` driver vs `vfio-pci`
-- [ ] Host prep actually applied on the workstation vs the XPS 13
+- [x] ~~libvirt / KVM present? IOMMU enabled?~~ — **all present and enabled**
+- [x] ~~NVIDIA driver binding~~ — all three cards on the host `nvidia` driver
+- [x] ~~Host prep applied on the workstation~~ — **recovered** from its shell history: `swapoff -a`,
+      `apt-get install containerd`, `systemctl enable --now containerd`, `modprobe br_netfilter`,
+      then `kubeadm join`. Note this is a **subset** of `bootstrap-control-plane.sh` — no
+      persisted `/etc/modules-load.d/k8s.conf`, no `/etc/sysctl.d/k8s.conf`, no
+      `SystemdCgroup = true` edit, no `apt-mark hold`. The worker's prep is less complete than the
+      control plane's and should not be assumed identical.
+- [ ] **Per-device IOMMU group isolation** for the three GPUs — blocks ADR-004
+- [ ] Which API endpoint the workstation's kubelet actually uses (`/etc/kubernetes/kubelet.conf`) —
+      resolves whether the control plane moved networks
+- [ ] Neutralise the `50-cloud-init.yaml` / `01-bridge.yaml` netplan conflict
 - [x] ~~Reason sshd is closed, and the intended admin path~~ — **answered**: no machine runs sshd;
       access is via Tailscale SSH. The workstation simply is not on the tailnet.
 - [ ] Get the workstation onto the tailnet (`tailscale up --ssh`) so it is reachable at all to this host
