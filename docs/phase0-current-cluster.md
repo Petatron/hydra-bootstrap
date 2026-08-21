@@ -2,7 +2,9 @@
 
 **Linear:** [PET-14 / BOOT-01](https://linear.app/petatron/issue/PET-14/boot-01-capture-the-current-manual-cluster-bootstrap-as-a-reproducible)
 **Captured:** 2026-08-20, from `ssh 100.116.30.60` (live cluster inspection)
-**Status:** control-plane/cluster facts verified. Hypervisor-host facts **pending host access** (see [Open items](#open-items)).
+**Status:** control-plane/cluster facts verified, including root-only facts (captured 2026-08-21).
+Original `kubeadm init` command **recovered**. Hypervisor-host facts still **pending host access**
+(see [Open items](#open-items)).
 
 This document records the cluster as it actually exists, not as the repos describe it. Where the
 two disagree, reality is recorded and the drift is listed in [Drift](#drift-repos-vs-reality).
@@ -116,12 +118,44 @@ healthzBindAddress: 127.0.0.1
 healthzPort: 10248
 ```
 
-### Certificate validity
+### Certificate validity — measured 2026-08-21
 
-`certificateValidityPeriod: 8760h` (1 year) with the cluster 128 days old means leaf certificates
-expire roughly **237 days from capture**. Exact expiry was **not** read — `kubeadm certs
-check-expiration` requires sudo and the session is password-gated. Record the real dates before
-closing PET-14; this is a recovery-critical fact and it is currently undocumented.
+From `sudo kubeadm certs check-expiration`:
+
+| Certificate | Expires | Residual | CA |
+|---|---|---|---|
+| `admin.conf`, `apiserver`, `apiserver-kubelet-client`, `controller-manager.conf`, `scheduler.conf`, `super-admin.conf` | 2027-04-14 03:44 UTC | 235d | `ca` |
+| `apiserver-etcd-client`, `etcd-healthcheck-client`, `etcd-peer`, `etcd-server` | 2027-04-14 03:44 UTC | 235d | `etcd-ca` |
+| `front-proxy-client` | 2027-04-14 03:44 UTC | 235d | `front-proxy-ca` |
+
+Certificate authorities: `ca`, `etcd-ca`, `front-proxy-ca` all expire **2036-04-11 03:18 UTC** (9 years).
+
+None are externally managed. All leaf certificates share one expiry date, so renewal is a single
+event rather than a staggered series.
+
+### API server certificate SANs
+
+```
+DNS:hlcluster-ctrlr0, DNS:kubernetes, DNS:kubernetes.default,
+DNS:kubernetes.default.svc, DNS:kubernetes.default.svc.cluster.local,
+IP Address:10.96.0.1, IP Address:192.168.16.10
+```
+
+This confirms the DHCP-assigned address is embedded in the serving certificate. There is **no
+stable DNS name** for the endpoint — `hlcluster-ctrlr0` is the hostname, not a resolvable record.
+Re-addressing the control plane therefore requires regenerating this certificate.
+
+### Static pod manifests
+
+`/etc/kubernetes/manifests/` (all written 2026-04-13 23:44, mode 0600 root:root):
+
+| File | Size |
+|---|---|
+| `etcd.yaml` | 2618 |
+| `kube-apiserver.yaml` | 3959 |
+| `kube-controller-manager.yaml` | 3458 |
+| `kube-scheduler.yaml` | 1726 |
+| `.kubelet-keep` | 0 (2026-03-18) |
 
 ---
 
@@ -140,9 +174,37 @@ which any reproduction must also perform:
 5. Add the `pkgs.k8s.io` apt repo, install `kubelet kubeadm kubectl`, `apt-mark hold` all three,
    enable kubelet.
 
-The script **stops before `kubeadm init`** — it only prints suggested next steps. The actual
-`kubeadm init` invocation used for this cluster is **not recorded anywhere** and is not
-recoverable from the script. See [Open items](#open-items).
+The script **stops before `kubeadm init`** — it only prints suggested next steps.
+
+### Recovered bootstrap sequence
+
+The actual invocation is **not** in the script, but it was recovered on 2026-08-21 from two
+independent sources that agree:
+
+- `/root/.bash_history`
+- the systemd journal: `Apr 13 23:18:52 hlcluster-ctrlr0 sudo[17529]: yibofu : ... COMMAND=/usr/bin/kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address=192.168.16.10`
+
+The sequence, in order:
+
+```bash
+sudo kubeadm init \
+  --pod-network-cidr=10.244.0.0/16 \
+  --apiserver-advertise-address=192.168.16.10
+
+chmod +x /home/yibofu/install-cilium.sh
+sudo bash ~/install-cilium.sh          # -> `cilium install` (CLI, not Helm)
+
+kubeadm token create --print-join-command
+```
+
+The worker was joined with the output of that last command — a standard token-based
+`kubeadm join <endpoint> --token <t> --discovery-token-ca-cert-hash sha256:<h>`. The literal token
+and hash are not recorded and are irrelevant (tokens expire after 24h by default).
+
+**This explains the pod-subnet mismatch.** `kubeadm init` was correctly given
+`--pod-network-cidr=10.244.0.0/16`, but `cilium install` does not read kubeadm's `podSubnet` — it
+defaults to its own `cluster-pool` of `10.0.0.0/8`. The divergence was an **oversight, not a
+deliberate choice**: nothing ever told Cilium about the intended range.
 
 The script's printed guidance does not match the cluster that was built (see Drift): it pins
 `KUBE_VERSION="v1.32"`, suggests `--pod-network-cidr=10.244.0.0/16`, and suggests Flannel.
@@ -248,19 +310,27 @@ control plane sits in `192.168.15.0/24` alongside the workstation. That is not t
 Facts a reproduction needs that are **not** currently recoverable from any source-controlled
 artifact or script:
 
-1. The exact `kubeadm init` command and flags used.
-2. The exact `kubeadm join` command used for `hycluster-worker-0`, and the host prep performed on
-   the workstation (the bootstrap script is only known to have been run on the XPS 13).
-3. Actual certificate expiry dates (`kubeadm certs check-expiration`).
-4. Why `podSubnet` was declared as `10.244.0.0/16` while Cilium was left on its default pool —
-   deliberate or overlooked.
-5. Whether the control-plane DHCP lease for `192.168.16.10` is reserved/static-mapped. If not,
-   a lease change invalidates the API endpoint in every kubeconfig and kubelet config.
+**Closed 2026-08-21:**
+
+1. ~~The exact `kubeadm init` command and flags.~~ **Recovered** — see above, corroborated by two
+   independent sources.
+2. ~~Actual certificate expiry dates.~~ **Measured** — see above.
+3. ~~Why `podSubnet` diverged from the Cilium pool.~~ **Answered** — `cilium install` ignores
+   kubeadm's `podSubnet`; it was an oversight.
+
+**Still open:**
+
+4. The literal `kubeadm join` command. The *generating* command is known
+   (`kubeadm token create --print-join-command`) and the form is standard, so this is closed for
+   reproduction purposes. The host prep actually performed on the workstation is **not** recorded —
+   `bootstrap-control-plane.sh` is only known to have run on the XPS 13.
+5. Whether the control-plane DHCP lease for `192.168.16.10` is reserved/static-mapped.
 6. Workstation host state: KVM/libvirt presence, IOMMU status, GPU driver binding, why sshd
    refuses connections.
 
-Items 1–2 are the core of PET-14's "no critical step depends on undocumented shell history"
-criterion and cannot be closed by inspection alone.
+PET-14's "no critical step depends on undocumented shell history" criterion is now **substantially
+met** for the control plane: the bootstrap is reproducible from recorded commands rather than
+reconstructed from observed state. It is **not** met for the worker's host preparation.
 
 ---
 
@@ -273,8 +343,6 @@ Blocked on access to the workstation (`192.168.15.13`), which refuses TCP 22:
 - [ ] Host prep actually applied on the workstation vs the XPS 13
 - [ ] Reason sshd is closed, and the intended admin path to this host
 
-Blocked on sudo on the control plane:
-
-- [ ] `kubeadm certs check-expiration` output
-- [ ] `/etc/kubernetes/manifests/*` static pod manifests verbatim
-- [ ] Whether `kubeadm init` flags survive in root shell history or `/var/log`
+~~Blocked on sudo on the control plane~~ — **resolved 2026-08-21**, passwordless sudo granted via
+`/etc/sudoers.d/yibofu-nopasswd`. Certificate expiry, static pod manifest inventory, certificate
+SANs, and the original `kubeadm init` command have all been captured above.
