@@ -229,21 +229,25 @@ cluster is consistent. But the join history, together with
 `hydra-infra/terraform.tfvars.example`'s `control_plane_ip = "192.168.15.10"`, is evidence that at
 some point the control plane sat at `192.168.15.10`, on the **same subnet as the workstation**.
 
-Two readings, not yet distinguished:
+**Resolved 2026-08-21.** The workstation's live kubelet configuration reads:
 
-1. **The control plane moved networks.** The XPS 13 was originally on `192.168.15.0/24` alongside
-   the workstation, and later moved behind a different router to `192.168.16.0/27`. Under this
-   reading the ~30 ms inter-site hop is a **regression**, not an original design choice, and the
-   `hydra-infra` tfvars was *correct when written*.
-2. **These are remnants of an earlier, discarded cluster** at `192.168.15.10`, and the current
-   cluster was always at `192.168.16.10`.
+```
+/etc/kubernetes/kubelet.conf ->  server: https://192.168.16.10:6443
+```
 
-Distinguishing them requires reading `/etc/kubernetes/kubelet.conf` on the workstation to see which
-endpoint its kubelet actually uses today. **Unresolved** — see [Open items](#open-items).
+`kubelet.conf` is written at join time and certificate rotation does not rewrite its server URL, so
+the **current** cluster was joined against `192.168.16.10`. The `192.168.15.10` entries in shell
+history therefore belong to an **earlier, discarded cluster generation** in which the control plane
+sat on the workstation's own subnet.
 
-Either way it strengthens the case for relocating the control plane onto the workstation: reading 1
-makes it a restoration of the original topology; reading 2 makes it the layout that was intended
-before the laptop was chosen.
+Consequences:
+
+- The ~30 ms inter-site hop was present from the **beginning of this cluster**. It is not a
+  regression that crept in — it was baked in at build time.
+- A previous cluster generation did have the control plane on `192.168.15.0/24`. So the topology
+  being proposed for the rebuild (control plane on the workstation) has precedent here.
+- `hydra-infra/terraform.tfvars.example` describes that **earlier** generation. It is genuinely
+  stale with respect to the running cluster, though its values were real rather than invented.
 
 **This explains the pod-subnet mismatch.** `kubeadm init` was correctly given
 `--pod-network-cidr=10.244.0.0/16`, but `cilium install` does not read kubeadm's `podSubnet` — it
@@ -402,16 +406,17 @@ moving it off the critical path ahead of PET-9.
 | 3 | `bootstrap-control-plane.sh`: suggests **Flannel** | **Cilium** 1.19.1 |
 | 4 | `hydra-infra` README: Terraform + `sync-nodes.sh` manage worker VMs | No VMs; the one worker is bare metal, joined manually |
 | 5 | `hydra-infra` README: "see `~/vms/setup-host.sh`" | Path does not exist on the control plane |
-| 6 | `hydra-infra` `terraform.tfvars.example`: `control_plane_ip = "192.168.15.10"` | Control plane is `192.168.16.10`. **Revised:** the worker's join history also references `192.168.15.10`, so this was likely accurate when written rather than wrong — see the join section |
+| 6 | `hydra-infra` `terraform.tfvars.example`: `control_plane_ip = "192.168.15.10"` | Control plane is `192.168.16.10`. The value describes an **earlier cluster generation** (confirmed: shell history joins to `.15.10`, but the live `kubelet.conf` points at `.16.10`). Stale with respect to the running cluster, but not invented |
 | 7 | `hydra-infra` `versions.tf`: `provider libvirt { uri = "qemu:///system" }` | Implies Terraform runs *on* the libvirt host; no libvirt host is configured |
 | 8 | `hydra-infra` expects bridge `br0`, image at `/home/yibofu/vms/images/...` | **Revised:** `br0` **does exist** on the workstation (`192.168.15.13/24`, UP). Only the control plane lacks it — the tfvars was written against the workstation, where it is correct |
 | 9 | `hydra-gitops`: 10 manifests (Argo CD, Cilium, KEDA, MetalLB, local-path) | **Nothing deployed**; no `argocd` namespace |
 | 10 | `hydra-gitops` app-of-apps owns Cilium | Cilium installed imperatively via `cilium install` CLI |
 
-Items 6–8 together indicate `terraform.tfvars.example` was written for a topology in which the
-control plane sits in `192.168.15.0/24` alongside the workstation, and was intended to run **on the
-workstation**. The worker's recovered join command corroborates that such a topology existed. It is
-not the current layout, but the file is better read as *stale relative to a move* than as wrong.
+Items 6–8 together indicate `terraform.tfvars.example` was written against an **earlier cluster
+generation** whose control plane sat in `192.168.15.0/24` alongside the workstation, and which was
+intended to run **on the workstation**. That generation demonstrably existed. The file is stale with
+respect to the running cluster, but `br0` and the general shape were accurate for the host it
+targets.
 
 ---
 
@@ -468,9 +473,18 @@ The three-GPU finding changes the available options qualitatively, not just quan
   `max: 3` is a real autoscaling demonstration, not a one-node token.
 - **Still out of reach:** "multiple GPU classes" (all three cards are the same model), vGPU
   (consumer silicon), and MIG (datacenter-only). Those roadmap items still need different hardware.
-- **New prerequisite:** passthrough requires each GPU in its **own** IOMMU group. 51 groups on a
-  Threadripper platform is promising but **unverified per-device**. This must be checked before
-  ADR-004 can be decided.
+- **Prerequisite satisfied.** Per-device IOMMU isolation verified 2026-08-21 — each GPU sits alone
+  in its own group with only its companion HDMI audio function:
+
+  | IOMMU group | Devices |
+  |---|---|
+  | 15 | `c1:00.0` GPU + `c1:00.1` audio |
+  | 26 | `01:00.0` GPU + `01:00.1` audio |
+  | 38 | `21:00.0` GPU + `21:00.1` audio |
+
+  No bridges or unrelated devices share these groups. This is textbook-clean for VFIO: each
+  GPU/audio pair can be passed to a guest independently, without pulling other hardware with it.
+  **All three cards are independently passable.**
 
 ## Open items
 
@@ -484,10 +498,12 @@ Blocked on access to the workstation (`192.168.15.13`), which refuses TCP 22:
       persisted `/etc/modules-load.d/k8s.conf`, no `/etc/sysctl.d/k8s.conf`, no
       `SystemdCgroup = true` edit, no `apt-mark hold`. The worker's prep is less complete than the
       control plane's and should not be assumed identical.
-- [ ] **Per-device IOMMU group isolation** for the three GPUs — blocks ADR-004
-- [ ] Which API endpoint the workstation's kubelet actually uses (`/etc/kubernetes/kubelet.conf`) —
-      resolves whether the control plane moved networks
+- [x] ~~Per-device IOMMU group isolation~~ — **verified clean**: groups 15 / 26 / 38, one GPU each
+- [x] ~~Which API endpoint the workstation's kubelet uses~~ — `https://192.168.16.10:6443`; the
+      `.15.10` history belongs to an earlier cluster generation
 - [ ] Neutralise the `50-cloud-init.yaml` / `01-bridge.yaml` netplan conflict
+- [ ] Choose a static address (or DNS name) for the relocated control-plane API endpoint
+- [ ] Decide the pod/VM resource split on the workstation
 - [x] ~~Reason sshd is closed, and the intended admin path~~ — **answered**: no machine runs sshd;
       access is via Tailscale SSH. The workstation simply is not on the tailnet.
 - [ ] Get the workstation onto the tailnet (`tailscale up --ssh`) so it is reachable at all to this host
