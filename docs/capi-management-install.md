@@ -48,18 +48,33 @@ convention `kubebuilder` follows in this project.
 
 ```bash
 V=v1.14.0
+ASSET=clusterctl-linux-amd64
 mkdir -p ~/bin
-curl -fsSLO "https://github.com/kubernetes-sigs/cluster-api/releases/download/${V}/clusterctl-linux-amd64"
-install -m 0755 clusterctl-linux-amd64 ~/bin/clusterctl
+cd "$(mktemp -d)"
+
+curl -fsSLO "https://github.com/kubernetes-sigs/cluster-api/releases/download/${V}/${ASSET}"
+
+# Verify before installing. The digest lives in the release asset's API
+# metadata, NOT in a separate .sha256 file -- see the note below.
+WANT=$(curl -fsSL "https://api.github.com/repos/kubernetes-sigs/cluster-api/releases/tags/${V}" \
+  | python3 -c "import json,sys;print(next(a['digest'] for a in json.load(sys.stdin)['assets'] if a['name']=='${ASSET}'))")
+GOT="sha256:$(sha256sum "${ASSET}" | cut -d' ' -f1)"
+[ "${WANT}" = "${GOT}" ] || { echo "DIGEST MISMATCH: want ${WANT}, got ${GOT}" >&2; exit 1; }
+
+install -m 0755 "${ASSET}" ~/bin/clusterctl
 ~/bin/clusterctl version
 ```
 
-> The release publishes **no checksum asset** for `clusterctl` — only the
-> platform binaries. Integrity here rests on HTTPS to the canonical
-> `kubernetes-sigs/cluster-api` repository plus a byte-size match against the
-> GitHub release API (34,861,218 bytes for `clusterctl-linux-amd64` at v1.14.0).
-> That is weaker than a published digest; do not describe it as checksum
-> verification.
+> **The release uploads no `.sha256` file, but it does publish a digest.** It is
+> the `digest` field on the asset in the releases API, and looking for a
+> checksum *file*, not finding one, and concluding that no digest exists is the
+> mistake to avoid — it throws away the only cryptographic check available. A
+> byte-size match is not a substitute: it cannot detect same-length corruption
+> or substitution.
+>
+> For v1.14.0 the published value is
+> `sha256:919ec7acb93ebdec9cde46727a1ddb8810ce55dd9ceef2d416ab65b6783bb58a`,
+> and the installed binary matches it.
 
 ```bash
 ~/bin/clusterctl init \
@@ -91,22 +106,41 @@ one.
 ## Verifying
 
 ```bash
-# every API the acceptance criteria name, with its stored contract version
-for k in clusters machines machinedeployments machinesets machinehealthchecks; do
-  printf '%-40s ' "$k"
-  kubectl get crd "$k.cluster.x-k8s.io" -o jsonpath='{.status.storedVersions}'; echo
+# every API checked, with its stored contract version -- all eight in one loop,
+# so the list here and the claimed result cannot drift apart
+for k in \
+  clusters.cluster.x-k8s.io \
+  machines.cluster.x-k8s.io \
+  machinesets.cluster.x-k8s.io \
+  machinedeployments.cluster.x-k8s.io \
+  machinehealthchecks.cluster.x-k8s.io \
+  kubeadmconfigs.bootstrap.cluster.x-k8s.io \
+  kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io \
+  kubeadmcontrolplanes.controlplane.cluster.x-k8s.io
+do
+  printf '%-52s ' "$k"
+  kubectl get crd "$k" -o jsonpath='{.status.storedVersions}' 2>/dev/null || printf 'MISSING'
+  echo
 done
-kubectl get crd kubeadmconfigs.bootstrap.cluster.x-k8s.io -o jsonpath='{.status.storedVersions}'; echo
-kubectl get crd kubeadmcontrolplanes.controlplane.cluster.x-k8s.io -o jsonpath='{.status.storedVersions}'; echo
 
-# controllers, and what clusterctl thinks it installed
-kubectl get deploy -A | grep -E 'capi-|cert-manager'
+# controller deployments: READY and AVAILABLE are the fields to read
+kubectl get deploy -A | grep -E 'NAME|capi-|cert-manager'
+
+# pod phase is a separate question from deployment readiness
+kubectl get pods -A | grep -E 'capi-|cert-manager'
+
+# what clusterctl believes it installed
 kubectl get providers -A
 ```
 
-Result on 2026-08-31: all eight named APIs present at `v1beta2`; all six
-deployments (3 CAPI + 3 cert-manager) `1/1` and `Running`; both nodes still
-`Ready` at v1.35.3.
+Result on 2026-08-31:
+
+- all eight APIs above present, each with `storedVersions` `["v1beta2"]`
+- all six deployments (3 CAPI + 3 cert-manager) `READY 1/1` with `AVAILABLE 1`,
+  and all six pods in phase `Running`
+- both nodes still `Ready` at v1.35.3
+- `kubectl get providers -A` reports `cluster-api`, `bootstrap-kubeadm` and
+  `control-plane-kubeadm`, all `v1.14.0`
 
 ## Undoing it
 
