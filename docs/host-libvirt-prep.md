@@ -153,26 +153,45 @@ The guest share of that is **16 vCPU / 48 GiB**, which fits four 4-vCPU/8-GiB
 workers with room, and leaves the larger share to pods since that is what this
 node is currently doing.
 
-Edit `/var/lib/kubelet/config.yaml` and add, at the top level:
-
-```yaml
-systemReserved:
-  cpu: "18"
-  memory: "52Gi"
-kubeReserved:
-  cpu: "1"
-  memory: "2Gi"
-```
+Set it in `/etc/default/kubelet`, **not** in `/var/lib/kubelet/config.yaml`:
 
 ```bash
+sudo cp /etc/default/kubelet /etc/default/kubelet.bak-$(date +%Y%m%d)
+printf 'KUBELET_EXTRA_ARGS=--system-reserved=cpu=18,memory=52Gi --kube-reserved=cpu=1,memory=2Gi\n' \
+  | sudo tee /etc/default/kubelet
 sudo systemctl restart kubelet
 ```
+
+> ### Why not `config.yaml`, which is the obvious place
+>
+> Because **`kubeadm upgrade node` regenerates it** from the cluster-wide
+> `kubelet-config` ConfigMap. A reservation written there is node-local
+> configuration living in a file kubeadm owns, and it disappears at the next
+> upgrade — silently, months later, with the symptom being pods and VMs
+> fighting over a host that looks correctly configured.
+>
+> `/etc/default/kubelet` is node-local and kubeadm does not rewrite it. This
+> unit sources it (`EnvironmentFiles=/etc/default/kubelet`) and expands
+> `$KUBELET_EXTRA_ARGS` **last** in `ExecStart`, so these flags also win over
+> anything in the config file.
+>
+> The cost is that `--system-reserved` and `--kube-reserved` are flags, and
+> kubelet flags are deprecated in favour of config. They still work in 1.35 and
+> this cluster is explicitly temporary, so the trade is worth it. The tidy
+> long-term form is a `--config-dir` drop-in
+> (`/etc/kubernetes/kubelet.conf.d/`), which is upgrade-safe *and* uses the
+> non-deprecated mechanism — two changes instead of one, worth doing if this
+> node ever stops being disposable.
 
 > **Deliberately no `systemReservedCgroup`.** Without it these numbers only
 > change the `Allocatable` arithmetic — they reserve headroom from the
 > *scheduler* rather than hard-limiting anything. That is what is wanted here:
 > a cgroup cap would throttle libvirt itself. If someone later "fixes" this by
 > adding the cgroup, they will have changed what it does.
+
+> **Editing over VS Code Remote SSH will not work** for this or any root-owned
+> file — the remote server runs as `yibofu` and gets `EACCES`. Use a terminal
+> with `sudo`.
 
 **Verify** — `allocatable` must now be visibly below `capacity`:
 
@@ -181,8 +200,9 @@ kubectl get node hycluster-worker-0 \
   -o jsonpath='{.status.capacity.cpu}/{.status.allocatable.cpu} cpu  {.status.capacity.memory}/{.status.allocatable.memory} mem{"\n"}'
 ```
 
-Expect roughly `48/29 cpu` and `131371300Ki/~74000000Ki mem`. If allocatable is
-unchanged, the file was not picked up — check `journalctl -u kubelet -n 50`.
+Expect roughly `48/29 cpu` and allocatable memory near `74600000Ki` (~71 GiB).
+If it still reports `48/48`, the restart did not pick the flags up — check
+`journalctl -u kubelet -n 30`.
 
 ---
 
@@ -411,20 +431,46 @@ PET-31's remaining acceptance criteria are documentation:
   its open questions
 - Note in the PET-31 worklog that the "no VMs exist" premise was wrong
 
-### Results
-
-*To be filled in as the steps are run.*
+### Results — completed 2026-09-01
 
 | Step | Outcome |
 |---|---|
-| 1 — kubelet reservations | *pending — needs root* |
-| 2 — pool and base image | *pending — needs root for the directory* |
-| 3 — VM create/destroy | **Proven 2026-08-31** in a throwaway pool; re-run against `k8s-workers` after step 2 |
-| 3 — DHCP on `br0`? | **Yes** — `192.168.15.203/24` |
-| 3 — guest agent reachable? | **Yes**, ~15 s after boot. Only working address source |
-| 3 — `domuuid` == `product_uuid`? | **Yes, exact** — `28c81977-a89c-4a83-b608-420d76ec9bf1` |
-| 4 — GPU binding | *deferred — see the reboot warning* |
+| 0 — control path | hostPath `/run/libvirt/libvirt-sock` + `nodeSelector`, **proven from a pod** (see below) |
+| 1 — kubelet reservations | **Done.** `48/29 cpu`, `131371300Ki/74645796Ki mem` (~71 GiB allocatable). Set in `/etc/default/kubelet`, kubelet healthy |
+| 2 — pool and base image | **Done.** Pool `k8s-workers` active + autostart, 914.78 GiB. Base image registered as a volume under the name the provider expects |
+| 3 — VM create/destroy | **Done, against the production pool.** Both disks as pool volumes, exactly the shape the provider produces |
+| 3 — DHCP on `br0`? | **Yes**, twice — `192.168.15.203/24` and `192.168.15.82/24` |
+| 3 — guest agent reachable? | **Yes**, ~10 s after boot. Only working address source |
+| 3 — `domuuid` == `product_uuid`? | **Yes, exact, twice** — `28c81977-…` and `d39d0480-41bb-40c1-9b0c-4ef7de075480` |
+| 3 — teardown reclaims both volumes | **Yes.** Pool back to just the base image, 601 M |
+| 4 — GPU binding | *Deferred — see the reboot warning. Nothing in PET-37 needs it* |
 | 5 — `wk1`–`wk3` disposition | Left shut off and untouched, as recommended |
+
+### The management cluster's path to libvirtd, proven
+
+Criterion 2 asks for a *working* path, so it was tested rather than assumed. A
+pod carrying the manager's exact security context was scheduled onto
+`hycluster-worker-0` with the socket mounted, twice:
+
+| Pod `securityContext` | Result |
+|---|---|
+| `supplementalGroups: [126]` | `groups=65532 126` → socket **writable**, connect would succeed |
+| omitted | `groups=65532` → socket **not writable**, provider would fail |
+
+> **The mount alone is not enough, and the failure does not look like a
+> permission problem.** The socket is `srw-rw---- root:libvirt` while the
+> manager runs as nonroot uid 65532, so without the group it is mounted,
+> visible and unopenable — and libvirt reports that as a connection failure.
+> The gid is per-host (126 on Ubuntu 24.04 here); read it with
+> `getent group libvirt`, do not copy the number. Now documented in the
+> provider's `config/manager/manager.yaml`.
+
+### One trap avoided this time
+
+Putting the cloud-init ISO into the pool as a **volume**, and referencing it as
+`vol=k8s-workers/…` rather than a loose path, stops `virt-install` defining its
+`dirpool` over `/`. It also matches what the provider actually does, so the test
+exercised the real shape rather than an approximation.
 
 ---
 
