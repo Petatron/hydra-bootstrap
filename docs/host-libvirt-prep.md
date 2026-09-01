@@ -59,6 +59,62 @@ it has a direct consequence for PET-37's `KubeadmConfigTemplate`.
 
 ---
 
+## Smoke test — already run, 2026-08-31. Both unknowns are answered
+
+A throwaway VM was built and destroyed on this host to settle the two questions
+that gated everything else. **Both came back positive**, and the host was left
+exactly as found (`wk1`–`wk3` shut off, three pools, nothing added).
+
+| Question | Answer |
+|---|---|
+| Does a guest on `br0` get an address? | **Yes — `192.168.15.203/24`**, DHCP, on the expected subnet. No `network-config` needed, so PET-9's ISO is correct as written |
+| Does `virsh domuuid` match the guest's `/sys/class/dmi/id/product_uuid`? | **Yes, exactly** — both `28c81977-a89c-4a83-b608-420d76ec9bf1`, same byte order, already lowercase |
+
+That second one is the load-bearing answer: **PET-37's providerID design works**,
+the guest can derive its own providerID from SMBIOS, and no provider code
+changes. The `tr 'A-Z' 'a-z'` in the `preKubeadmCommands` snippet turns out to be
+unnecessary — keep it anyway, it costs nothing and guards other hardware.
+
+Proven along the way, all without root:
+
+- A `cidata` ISO built with `genisoimage` is found and consumed by cloud-init
+- `local-hostname` in `meta-data` sets the guest hostname (`hydra-smoke`) —
+  which is exactly what PET-9's `Hostname` field feeds
+- A copy-on-write clone from the base image boots
+- **`--source agent` is the only address source that works.** `--source arp`
+  returned nothing for the whole run, `--source lease` cannot work for a bridge
+  libvirt does not manage. The agent answered within ~15 s of boot
+
+### Three operational traps, all hit during the test
+
+> **`virsh console` needs a controlling TTY and a stdin that stays open.**
+> Over a non-interactive SSH it fails with *"Cannot run interactive console
+> without a controlling TTY"*; with `ssh -tt` it connects and then exits
+> immediately when stdin reaches EOF. Neither failure looks like a VM problem,
+> and both waste time. Use the guest agent instead — it needs no terminal:
+> ```bash
+> virsh -c qemu:///system qemu-agent-command <dom> \
+>   '{"execute":"guest-file-open","arguments":{"path":"/sys/class/dmi/id/product_uuid","mode":"r"}}'
+> # then guest-file-read with the returned handle; the buffer is base64
+> ```
+
+> **A file-backed serial is written as `root:root` mode 0600**, and ownership is
+> *not* restored when the domain stops. Configure one and you cannot read your
+> own console log without `sudo`. The agent route above sidesteps it entirely.
+
+> **`virt-install` silently defines a storage pool named `dirpool` targeting
+> `/`.** It appears in `pool-list` alongside the real pools and enumerates the
+> whole root filesystem as volumes. Remove it with `pool-destroy` +
+> `pool-undefine` — **never `pool-delete`**, which operates on the files.
+
+### What this leaves
+
+Steps 1 and 2 are the only real work remaining, and neither is large. Step 3 is
+now a re-run of a known-good procedure against the production pool rather than
+an experiment.
+
+---
+
 ## Step 0 — Decide the libvirt control path *(no root; decide before Step 1)*
 
 ADR-003 left two candidates open. The state above changes the balance, and there
@@ -241,7 +297,9 @@ this host — checked 2026-08-31, nothing to install for this step.
 > interval. The alternative is baking the agent into the base image, which is
 > tidier for a fleet and worth considering once there is more than one.
 
-**Verify, in this order — each answers a different open question:**
+**Verify.** The two questions below were already answered by the 2026-08-31
+smoke test; re-running them here confirms the *production pool* works, not the
+technique:
 
 ```bash
 # 1. it runs
@@ -359,14 +417,14 @@ PET-31's remaining acceptance criteria are documentation:
 
 | Step | Outcome |
 |---|---|
-| 1 — kubelet reservations | |
-| 2 — pool and base image | |
-| 3 — VM create/destroy | |
-| 3 — DHCP on `br0`? (agent source) | |
-| 3 — guest agent reachable at all? | |
-| 3 — `domuuid` == `product_uuid`? | |
-| 4 — GPU binding | |
-| 5 — `wk1`–`wk3` disposition | |
+| 1 — kubelet reservations | *pending — needs root* |
+| 2 — pool and base image | *pending — needs root for the directory* |
+| 3 — VM create/destroy | **Proven 2026-08-31** in a throwaway pool; re-run against `k8s-workers` after step 2 |
+| 3 — DHCP on `br0`? | **Yes** — `192.168.15.203/24` |
+| 3 — guest agent reachable? | **Yes**, ~15 s after boot. Only working address source |
+| 3 — `domuuid` == `product_uuid`? | **Yes, exact** — `28c81977-a89c-4a83-b608-420d76ec9bf1` |
+| 4 — GPU binding | *deferred — see the reboot warning* |
+| 5 — `wk1`–`wk3` disposition | Left shut off and untouched, as recommended |
 
 ---
 
