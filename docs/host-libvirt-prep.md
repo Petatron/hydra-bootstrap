@@ -431,20 +431,46 @@ PET-31's remaining acceptance criteria are documentation:
   its open questions
 - Note in the PET-31 worklog that the "no VMs exist" premise was wrong
 
-### Results
-
-*To be filled in as the steps are run.*
+### Results — completed 2026-09-01
 
 | Step | Outcome |
 |---|---|
-| 1 — kubelet reservations | *pending — needs root* |
-| 2 — pool and base image | *pending — needs root for the directory* |
-| 3 — VM create/destroy | **Proven 2026-08-31** in a throwaway pool; re-run against `k8s-workers` after step 2 |
-| 3 — DHCP on `br0`? | **Yes** — `192.168.15.203/24` |
-| 3 — guest agent reachable? | **Yes**, ~15 s after boot. Only working address source |
-| 3 — `domuuid` == `product_uuid`? | **Yes, exact** — `28c81977-a89c-4a83-b608-420d76ec9bf1` |
-| 4 — GPU binding | *deferred — see the reboot warning* |
+| 0 — control path | hostPath `/run/libvirt/libvirt-sock` + `nodeSelector`, **proven from a pod** (see below) |
+| 1 — kubelet reservations | **Done.** `48/29 cpu`, `131371300Ki/74645796Ki mem` (~71 GiB allocatable). Set in `/etc/default/kubelet`, kubelet healthy |
+| 2 — pool and base image | **Done.** Pool `k8s-workers` active + autostart, 914.78 GiB. Base image registered as a volume under the name the provider expects |
+| 3 — VM create/destroy | **Done, against the production pool.** Both disks as pool volumes, exactly the shape the provider produces |
+| 3 — DHCP on `br0`? | **Yes**, twice — `192.168.15.203/24` and `192.168.15.82/24` |
+| 3 — guest agent reachable? | **Yes**, ~10 s after boot. Only working address source |
+| 3 — `domuuid` == `product_uuid`? | **Yes, exact, twice** — `28c81977-…` and `d39d0480-41bb-40c1-9b0c-4ef7de075480` |
+| 3 — teardown reclaims both volumes | **Yes.** Pool back to just the base image, 601 M |
+| 4 — GPU binding | *Deferred — see the reboot warning. Nothing in PET-37 needs it* |
 | 5 — `wk1`–`wk3` disposition | Left shut off and untouched, as recommended |
+
+### The management cluster's path to libvirtd, proven
+
+Criterion 2 asks for a *working* path, so it was tested rather than assumed. A
+pod carrying the manager's exact security context was scheduled onto
+`hycluster-worker-0` with the socket mounted, twice:
+
+| Pod `securityContext` | Result |
+|---|---|
+| `supplementalGroups: [126]` | `groups=65532 126` → socket **writable**, connect would succeed |
+| omitted | `groups=65532` → socket **not writable**, provider would fail |
+
+> **The mount alone is not enough, and the failure does not look like a
+> permission problem.** The socket is `srw-rw---- root:libvirt` while the
+> manager runs as nonroot uid 65532, so without the group it is mounted,
+> visible and unopenable — and libvirt reports that as a connection failure.
+> The gid is per-host (126 on Ubuntu 24.04 here); read it with
+> `getent group libvirt`, do not copy the number. Now documented in the
+> provider's `config/manager/manager.yaml`.
+
+### One trap avoided this time
+
+Putting the cloud-init ISO into the pool as a **volume**, and referencing it as
+`vol=k8s-workers/…` rather than a loose path, stops `virt-install` defining its
+`dirpool` over `/`. It also matches what the provider actually does, so the test
+exercised the real shape rather than an approximation.
 
 ---
 
