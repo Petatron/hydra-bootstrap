@@ -153,26 +153,45 @@ The guest share of that is **16 vCPU / 48 GiB**, which fits four 4-vCPU/8-GiB
 workers with room, and leaves the larger share to pods since that is what this
 node is currently doing.
 
-Edit `/var/lib/kubelet/config.yaml` and add, at the top level:
-
-```yaml
-systemReserved:
-  cpu: "18"
-  memory: "52Gi"
-kubeReserved:
-  cpu: "1"
-  memory: "2Gi"
-```
+Set it in `/etc/default/kubelet`, **not** in `/var/lib/kubelet/config.yaml`:
 
 ```bash
+sudo cp /etc/default/kubelet /etc/default/kubelet.bak-$(date +%Y%m%d)
+printf 'KUBELET_EXTRA_ARGS=--system-reserved=cpu=18,memory=52Gi --kube-reserved=cpu=1,memory=2Gi\n' \
+  | sudo tee /etc/default/kubelet
 sudo systemctl restart kubelet
 ```
+
+> ### Why not `config.yaml`, which is the obvious place
+>
+> Because **`kubeadm upgrade node` regenerates it** from the cluster-wide
+> `kubelet-config` ConfigMap. A reservation written there is node-local
+> configuration living in a file kubeadm owns, and it disappears at the next
+> upgrade — silently, months later, with the symptom being pods and VMs
+> fighting over a host that looks correctly configured.
+>
+> `/etc/default/kubelet` is node-local and kubeadm does not rewrite it. This
+> unit sources it (`EnvironmentFiles=/etc/default/kubelet`) and expands
+> `$KUBELET_EXTRA_ARGS` **last** in `ExecStart`, so these flags also win over
+> anything in the config file.
+>
+> The cost is that `--system-reserved` and `--kube-reserved` are flags, and
+> kubelet flags are deprecated in favour of config. They still work in 1.35 and
+> this cluster is explicitly temporary, so the trade is worth it. The tidy
+> long-term form is a `--config-dir` drop-in
+> (`/etc/kubernetes/kubelet.conf.d/`), which is upgrade-safe *and* uses the
+> non-deprecated mechanism — two changes instead of one, worth doing if this
+> node ever stops being disposable.
 
 > **Deliberately no `systemReservedCgroup`.** Without it these numbers only
 > change the `Allocatable` arithmetic — they reserve headroom from the
 > *scheduler* rather than hard-limiting anything. That is what is wanted here:
 > a cgroup cap would throttle libvirt itself. If someone later "fixes" this by
 > adding the cgroup, they will have changed what it does.
+
+> **Editing over VS Code Remote SSH will not work** for this or any root-owned
+> file — the remote server runs as `yibofu` and gets `EACCES`. Use a terminal
+> with `sudo`.
 
 **Verify** — `allocatable` must now be visibly below `capacity`:
 
@@ -181,8 +200,9 @@ kubectl get node hycluster-worker-0 \
   -o jsonpath='{.status.capacity.cpu}/{.status.allocatable.cpu} cpu  {.status.capacity.memory}/{.status.allocatable.memory} mem{"\n"}'
 ```
 
-Expect roughly `48/29 cpu` and `131371300Ki/~74000000Ki mem`. If allocatable is
-unchanged, the file was not picked up — check `journalctl -u kubelet -n 50`.
+Expect roughly `48/29 cpu` and allocatable memory near `74600000Ki` (~71 GiB).
+If it still reports `48/48`, the restart did not pick the flags up — check
+`journalctl -u kubelet -n 30`.
 
 ---
 
