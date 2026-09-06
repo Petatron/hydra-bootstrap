@@ -49,6 +49,12 @@ in the provider repo is the verified copy:
 - **`HydraMachineTemplate`** — the control-plane machine shape
 - **`KubeadmControlPlane`** — replicas, version, and the kubeadm config
 
+**That example ships `replicas: 3`, which is the finished state.** Applying it
+as-is works — KCP initialises the first node and joins the other two. This
+walkthrough sets `replicas: 1` first and scales in step 4, only because a single
+node makes the failure modes far easier to see. Either path is fine; pick one and
+do not be surprised when step 4 is a no-op because you already asked for three.
+
 State the pod CIDR **once**, on `Cluster.spec.clusterNetwork`. KCP propagates it
 into kubeadm's configuration, and the CNI must later be given the same value.
 Letting those two drift is a real defect in the older hand-built cluster.
@@ -95,6 +101,24 @@ are reclaimed on the way out.
 The node stays `NotReady` until one exists, and Argo CD cannot run before the
 node is Ready — so this one step cannot itself be GitOps-driven.
 
+**Switch to the new cluster first.** Everything up to here ran against the
+management cluster; everything from here runs against the one just built. Cluster
+API publishes its kubeconfig as a Secret as soon as the control plane
+initialises:
+
+```
+kubectl get secret <cluster>-kubeconfig -n <namespace> \
+  -o jsonpath='{.data.value}' | base64 -d > <cluster>.kubeconfig
+export KUBECONFIG=$PWD/<cluster>.kubeconfig
+kubectl get nodes            # expect one NotReady control-plane node
+```
+
+`clusterctl get kubeconfig <cluster> -n <namespace>` does the same thing if you
+have it. Keep this kubeconfig — step 5 needs it too.
+
+Forgetting this is not a harmless mistake: `cilium install` would target whatever
+the current context is and install a second CNI into the **management** cluster.
+
 ```
 cilium install --set ipam.operator.clusterPoolIPv4PodCIDRList[0]=10.244.0.0/16
 ```
@@ -112,9 +136,17 @@ answer across a leader failover during a rolling replacement.
 
 Workers come from a `MachineDeployment` over a `HydraMachineTemplate` and a
 **`KubeadmConfigTemplate`** —
-[`machinedeployment-adopted-cluster.yaml`](https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/examples/machinedeployment-adopted-cluster.yaml)
-shows the shape, though on a cluster built this way you use `configRef` rather
-than the `dataSecretName` that file needs.
+[`machinedeployment-kubeadmconfigtemplate.yaml`](https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/examples/machinedeployment-kubeadmconfigtemplate.yaml)
+is the verified copy, and the one to use on a cluster built this way.
+
+(The neighbouring `machinedeployment-adopted-cluster.yaml` supplies bootstrap
+data through `dataSecretName` instead. That exists for clusters Cluster API did
+not build, where CABPK will not generate a join at all. It is not what you want
+here.)
+
+The template installs the container runtime and kubeadm, because the base cloud
+image has neither, and writes the same sysctl files the control plane needed —
+`kubeadm join` runs the same preflight checks as `init`.
 
 Workers do **not** take `--node-ip`. That flag exists only because of kube-vip's
 floating address on the control plane; a worker has one address and the
@@ -122,10 +154,18 @@ kubelet's own choice is correct.
 
 ## 5. Hand off to Argo CD
 
+Still against the workload cluster's kubeconfig from step 3.
+
 ```
+kubectl create namespace argocd
 kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml --server-side
+kubectl -n argocd rollout status deployment argocd-server --timeout=300s
 kubectl apply -f clusters/<cluster>/root-app.yaml
 ```
+
+The namespace has to be created first — the upstream install manifest does not
+create it, so the apply fails with `namespaces "argocd" not found` on a fresh
+cluster.
 
 From here the cluster is driven by commits.
 
