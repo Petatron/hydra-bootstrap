@@ -41,13 +41,19 @@ Getting this wrong is not recoverable in place. The cluster has to be rebuilt.
 ## 1. Declare the cluster
 
 Four objects, applied together —
-[`cluster-with-kubeadm-control-plane.yaml`](https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/examples/cluster-with-kubeadm-control-plane.yaml)
+[`cluster-with-kubeadm-control-plane.yaml`](https://github.com/Petatron/cluster-api-provider-hydra/blob/9d606be3d809c7237b6a292e8e4608d03452cb53/docs/examples/cluster-with-kubeadm-control-plane.yaml)
 in the provider repo is the verified copy:
 
 - **`HydraCluster`** — the endpoint, storage pool, base image, networks
 - **`Cluster`** — pod and service CIDRs, pointing at the HydraCluster and the KCP
 - **`HydraMachineTemplate`** — the control-plane machine shape
 - **`KubeadmControlPlane`** — replicas, version, and the kubeadm config
+
+Those example links are pinned to the commit this run was verified against,
+not to `main`. The provider's examples will keep improving, and a floating link
+would quietly leave this document describing something that no longer matches
+what it points at. Check `main` for the current version; trust the pinned one to
+match what is written here.
 
 **That example ships `replicas: 3`, which is the finished state.** Applying it
 as-is works — KCP initialises the first node and joins the other two. This
@@ -113,8 +119,12 @@ export KUBECONFIG=$PWD/<cluster>.kubeconfig
 kubectl get nodes            # expect one NotReady control-plane node
 ```
 
-`clusterctl get kubeconfig <cluster> -n <namespace>` does the same thing if you
-have it. Keep this kubeconfig — step 5 needs it too.
+`~/bin/clusterctl get kubeconfig <cluster> -n <namespace>` does the same thing.
+Full path deliberately: `clusterctl` is installed per-user and **not on `PATH`**,
+the same convention the rest of this repository follows — see
+[`capi-management-install.md`](capi-management-install.md).
+
+Keep this kubeconfig. Step 5 needs it too.
 
 Forgetting this is not a harmless mistake: `cilium install` would target whatever
 the current context is and install a second CNI into the **management** cluster.
@@ -136,7 +146,7 @@ answer across a leader failover during a rolling replacement.
 
 Workers come from a `MachineDeployment` over a `HydraMachineTemplate` and a
 **`KubeadmConfigTemplate`** —
-[`machinedeployment-kubeadmconfigtemplate.yaml`](https://github.com/Petatron/cluster-api-provider-hydra/blob/main/docs/examples/machinedeployment-kubeadmconfigtemplate.yaml)
+[`machinedeployment-kubeadmconfigtemplate.yaml`](https://github.com/Petatron/cluster-api-provider-hydra/blob/9d606be3d809c7237b6a292e8e4608d03452cb53/docs/examples/machinedeployment-kubeadmconfigtemplate.yaml)
 is the verified copy, and the one to use on a cluster built this way.
 
 (The neighbouring `machinedeployment-adopted-cluster.yaml` supplies bootstrap
