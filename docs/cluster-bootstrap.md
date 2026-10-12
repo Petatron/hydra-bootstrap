@@ -40,14 +40,15 @@ Getting this wrong is not recoverable in place. The cluster has to be rebuilt.
 
 ## 1. Declare the cluster
 
-Four objects, applied together —
-[`cluster-with-kubeadm-control-plane.yaml`](https://github.com/Petatron/cluster-api-provider-hydra/blob/9d606be3d809c7237b6a292e8e4608d03452cb53/docs/examples/cluster-with-kubeadm-control-plane.yaml)
+Five objects, applied together —
+[`cluster-with-kubeadm-control-plane.yaml`](https://github.com/Petatron/cluster-api-provider-hydra/blob/2c4b3c3bb62f0ec070feab660c5f453b588c0274/docs/examples/cluster-with-kubeadm-control-plane.yaml)
 in the provider repo is the verified copy:
 
 - **`HydraCluster`** — the endpoint, storage pool, base image, networks
 - **`Cluster`** — pod and service CIDRs, pointing at the HydraCluster and the KCP
 - **`HydraMachineTemplate`** — the control-plane machine shape
 - **`KubeadmControlPlane`** — replicas, version, and the kubeadm config
+- **`MachineHealthCheck`** — replaces a control-plane machine that has failed (PET-22)
 
 Those example links are pinned to the commit this run was verified against,
 not to `main`. The provider's examples will keep improving, and a floating link
@@ -83,7 +84,7 @@ The base cloud image carries no container runtime or kubeadm, so
 `sysctl --system` only applies what is already on disk, and without it kubeadm's
 preflight fails on `net.ipv4.ip_forward`.
 
-> `hydra cluster create` should render all four objects from a much smaller
+> `hydra cluster create` should render all five objects from a much smaller
 > input: a name, a size, a Kubernetes version, an endpoint. Everything above is
 > derivable.
 
@@ -141,12 +142,22 @@ The CIDR **must** match `Cluster.spec.clusterNetwork.pods`.
 ## 4. Scale the control plane and add workers
 
 Set `KubeadmControlPlane.spec.replicas` to 3. KCP adds them one at a time, and
-the endpoint keeps serving throughout — verified here by watching `/healthz`
-answer across a leader failover during a rolling replacement.
+the endpoint keeps serving while it does: adding a control plane never moves the
+VIP.
+
+Losing one is different, and was measured with failure drills (PET-22). A
+control plane that does not hold the VIP can die without costing any API time.
+Losing the VIP holder costs about 6 seconds while another control plane takes
+the address; it was 10–20 seconds before kube-vip's lease was shortened to 5s.
+Either way the `MachineHealthCheck` replaces the dead machine in about eight
+minutes, with no one involved. It stands down when two or more are unhealthy at
+once, because a three-member etcd has no quorum then; that is for a human.
+All three control planes share one hypervisor in the reference lab, so this is
+VM-level HA: losing the host still loses the cluster.
 
 Workers come from a `MachineDeployment` over a `HydraMachineTemplate` and a
 **`KubeadmConfigTemplate`** —
-[`machinedeployment-kubeadmconfigtemplate.yaml`](https://github.com/Petatron/cluster-api-provider-hydra/blob/9d606be3d809c7237b6a292e8e4608d03452cb53/docs/examples/machinedeployment-kubeadmconfigtemplate.yaml)
+[`machinedeployment-kubeadmconfigtemplate.yaml`](https://github.com/Petatron/cluster-api-provider-hydra/blob/2c4b3c3bb62f0ec070feab660c5f453b588c0274/docs/examples/machinedeployment-kubeadmconfigtemplate.yaml)
 is the verified copy, and the one to use on a cluster built this way.
 
 (The neighbouring `machinedeployment-adopted-cluster.yaml` supplies bootstrap
