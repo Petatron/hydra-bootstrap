@@ -19,6 +19,7 @@ management cluster, and workload clusters.
 | `docs/capi-management-install.md` | How the existing cluster became the CAPI management cluster, and how to undo it (PET-5) | Done, executed |
 | `docs/host-libvirt-prep.md` | Preparing the workstation as a libvirt hypervisor alongside bare metal (PET-31, ADR-003) | Done, executed |
 | `docs/cluster-bootstrap.md` | How `hydra-wl0` was built end to end by Cluster API with **no manual `kubeadm` run anywhere** (PET-16, PET-17) | Done, executed |
+| `docs/control-plane-address-change.md` | What to do when the management control plane's DHCP address changes: prevent, restore, last-resort re-address (PET-32) | **Written, never executed** |
 | `docs/rebuild-control-plane.md` | Rebuild spec relocating the control plane to the workstation | **Obsolete — see below** |
 
 ### `phase0-current-cluster.md` outranks your own inspection

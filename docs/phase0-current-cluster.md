@@ -2,6 +2,7 @@
 
 **Linear:** [PET-14 / BOOT-01](https://linear.app/petatron/issue/PET-14/boot-01-capture-the-current-manual-cluster-bootstrap-as-a-reproducible)
 **Captured:** 2026-08-20, from `ssh 100.116.30.60` (live cluster inspection)
+**Re-checked:** 2026-11-06 for [PET-32 / NET-01](https://linear.app/petatron/issue/PET-32/net-01-harden-control-plane-network-and-api-endpoint-assumptions), read-only — see [§9](#9-network-re-check--2026-11-06-pet-32)
 **Status:** both hosts inspected. Control-plane facts verified 2026-08-20/21; workstation facts
 verified 2026-08-21 via a privileged Kubernetes debug pod. Original `kubeadm init` **recovered**.
 
@@ -61,6 +62,8 @@ The two machines are **not on the same L2 segment or the same L3 network**:
 - Measured RTT control plane → worker: **~30 ms** (min 29.2 / avg 30.6 / max 31.7 ms).
 - Path MTU: **1420**.
 - The control plane has no route to `192.168.15.0/24`; traffic exits via the default gateway.
+  *(Misleading — corrected 2026-11-06, [Corrections](#corrections) #7: the default gateway **is** the
+  route. The two sites are joined by UniFi SD-WAN, and `192.168.0.1` is its tunnel peer.)*
 - Control-plane uplink is a **USB Ethernet dongle** (`enx9c69d34cc8a1`, MTU 1500). Onboard Wi-Fi
   (`wlp2s0`) is DOWN.
 - The control-plane node address is **DHCP-assigned** (`proto dhcp`), and that address is the
@@ -288,6 +291,9 @@ the `tailscale0` interface (MTU 1280) rather than the 1500-MTU egress NIC.
 
 **Pod traffic between the two hosts is unencrypted VXLAN across a routed ~30 ms path.**
 
+*Re-checked 2026-11-06: all of this still holds. The pod CIDR divergence and the MTU are now
+accepted on this cluster rather than fixed — see [§9](#9-network-re-check--2026-11-06-pet-32).*
+
 ---
 
 ## 5. Deployed platform add-ons
@@ -307,6 +313,9 @@ static control-plane pods).
 Both CoreDNS replicas run on the **control plane** (`10.0.0.181`, `10.0.0.140`). Every DNS query
 from a workload pod — and all workloads run on the worker — therefore crosses the ~30 ms link and
 back. Worth fixing independently of Hydra; it is a standing latency tax on every workload.
+
+*No longer true — corrected 2026-11-06, [Corrections](#corrections) #8: the workloads moved onto
+the control plane, so the placement now matches the load.*
 
 ---
 
@@ -449,6 +458,28 @@ reconstructed from observed state. It is **not** met for the worker's host prepa
 
 ---
 
+## 9. Network re-check — 2026-11-06 (PET-32)
+
+**State verified:** 2026-11-06, read-only, `kubectl` and `openssl` on `hlcluster-ctrlr0`
+(`192.168.16.10`, v1.35.3) and `hydra-wl0` through the SOCKS tunnel. Nothing was changed.
+
+PET-74 plans to replace this cluster with a management cluster Cluster API builds, so PET-32 was
+re-scoped (Yibo, 2026-11-06): **mitigate and document here, and carry the real fixes into PET-74.**
+
+| # | Finding (2026-08) | State 2026-11-06 | Decision |
+|---|---|---|---|
+| 1 | API endpoint is a DHCP address on a USB NIC | **Still true.** `192.168.16.10/27 proto dhcp` on `enx9c69d34cc8a1`. Serving cert SANs are that IP plus the default names — no DNS name, no VIP; no `controlPlaneEndpoint` in `kubeadm-config` | **Mitigate:** a fixed IP for the dongle's MAC on the home UniFi, and [`control-plane-address-change.md`](./control-plane-address-change.md) for when it changes anyway. A VIP or DNS endpoint is a PET-74 criterion. |
+| 2 | Hosts ~30 ms apart, no route | Routed via SD-WAN ([Corrections](#corrections) #7). Every CAPI controller runs on this node, ~30 ms from every VM and API it manages | Where management runs is **PET-74's ADR**. |
+| 3 | Pod traffic unencrypted | Still no WireGuard / IPsec in `cilium-config`. The inter-site hop is UniFi SD-WAN, believed WireGuard-based — **not confirmed** | **Accept on this cluster** if SD-WAN encryption is confirmed; the decision for the new cluster is a PET-74 criterion. |
+| 4 | CoreDNS on the control plane | Placement now matches the load ([Corrections](#corrections) #8) | **No change.** |
+| 5 | Pod MTU 1230 vs path 1420 | Still: `cilium_host` 1280, remote pod routes 1230. The same 1230 appears on the workstation for `hydra-wl0`, which also runs Tailscale | **Accept**: conservative, not broken (throughput only). Restarting Cilium on the management cluster to fix it is not worth it. Set explicitly in PET-74. |
+| 6 | kubeadm `10.244.0.0/16` vs Cilium `10.0.0.0/8` | Unchanged here. **`hydra-wl0` agrees** (both `10.244.0.0/16`), because the KCP example installs Cilium with the pod CIDR | **Accept as deliberate on this cluster** (re-IPing every pod of a cluster PET-74 retires is not worth it). Clusters Cluster API builds do not inherit it. |
+
+For comparison, `hydra-wl0`: endpoint is the kube-vip VIP `192.168.15.10:6443`, kubeadm and Cilium
+agree on `10.244.0.0/16`, CoreDNS runs on two different nodes.
+
+---
+
 ## Corrections
 
 Entries in earlier revisions of this document that turned out to be wrong, and what replaced them.
@@ -461,6 +492,9 @@ Entries in earlier revisions of this document that turned out to be wrong, and w
 | 4 | Certificate expiry ≈ 237 days (estimated) | **2027-04-14**, 235 days; CAs 2036-04-11 (measured) | Renewal is one event, all leaf certs share a date. |
 | 5 | `hydra-infra`'s `control_plane_ip` and `br0` assumptions are drift/wrong | Both were likely **correct when written**; `br0` exists on the workstation and the join history references `192.168.15.10` | The repo is stale relative to a topology *change*, not built on false assumptions. |
 | 6 | The workstation "refuses SSH", implying a misconfiguration | Neither host runs `sshd`; access is Tailscale SSH. The block is a **tailnet ACL**, confirmed by `ufw` inactive and `iptables` INPUT ACCEPT | Fix is in the Tailscale admin console, not on the host. |
+| 7 | The control plane has no route to `192.168.15.0/24`; `192.168.0.1` is an "upstream router" | The default route reaches the office through **UniFi SD-WAN**; `192.168.0.1` is its tunnel peer (`tracepath` 2026-11-06: path MTU 1420, RTT ≈ 31 ms). SD-WAN carries only networks UniFi defines at each site — a static route at one site is not advertised to the other (PET-75) | Cross-site reachability is set in UniFi, not on the hosts. |
+| 8 | Every workload DNS query crosses the inter-site hop because both CoreDNS replicas sit on the control plane | Since the cluster became the CAPI management cluster, **34 of 41 pods run on `hlcluster-ctrlr0`** (every management controller is pinned there); the two worker VMs carry 7 system pods. CoreDNS on the control plane is next to its clients | PET-32 item 4 needs no change. |
+| 9 | (implicit) the cluster's workers are the bare-metal workstation | The workers are now two **Hydra-managed VMs** (`hydra-md-0-mj9gx-4c6dv` `192.168.15.52`, `hydra-worker-0` `192.168.15.200`); the workstation is a node of `hydra-wl0` instead | Anything in §1 about "the worker" describes the August state. |
 
 ### ADR-004 must be rewritten
 
