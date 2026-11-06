@@ -26,6 +26,10 @@ cluster until then.
 
 ## 1. Prevent it — fixed IP on the home router
 
+**In place:** the UniFi admin confirmed on 2026-11-06 that `192.168.16.10` is already a fixed IP
+for this client. The host still takes it by DHCP (`proto dhcp`); the router just always hands out
+the same address. The steps below are for re-creating or moving the reservation.
+
 **Who:** the home UniFi console's owner. No root on any host.
 
 1. UniFi Network → **Client Devices** → `hlcluster-ctrlr0` (MAC of `enx9c69d34cc8a1`) →
