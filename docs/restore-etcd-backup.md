@@ -6,12 +6,17 @@
 **Backups:** hourly, taken by CronJobs on `hlcluster` (`hlcluster-ctrlr0`, the XPS) — `etcd-backup-hydra-mgmt`
 at :37 and `etcd-backup-hydra-wl0` at :07 — written age-encrypted to `/var/lib/hydra-backup/<cluster>/`
 on `hlcluster-ctrlr0`. Manifests: hydra-gitops `clusters/hydra-wl0/management-cluster/etcd-backup*.yaml`.
-**Clusters:** `hydra-mgmt` (3 KCP members, VIP `192.168.15.11`) and `hydra-wl0` (3 KCP members, VIP
-`192.168.15.10`), both Kubernetes v1.35.3, etcd 3.6, on the office hypervisor.
-**State verified:** 2026-11-10.
+Since the PET-74 move (2026-11-13) the jobs find each cluster's etcd members by listing Machines through
+hydra-mgmt's API (`KUBE_API`, `SA_DIR`), because that is where the Cluster API objects now live.
+**Clusters:** `hydra-mgmt` (3 KCP members, VIP `192.168.15.11`; since 2026-11-13 the management cluster,
+holding its own Cluster API objects and hydra-wl0's) and `hydra-wl0` (3 KCP members, VIP `192.168.15.10`),
+both Kubernetes v1.35.3, etcd 3.6, on the office hypervisor.
+**State verified:** 2026-11-10 and 2026-11-13.
 
 > **Status.** [§2, the verification drill](#2-verification-drill--prove-a-backup-restores) was **executed on
-> 2026-11-10** against both clusters' backups; the results are in [§3](#3-results-2026-11-10).
+> 2026-11-10** against both clusters' backups, and **again on 2026-11-13** against hydra-mgmt after it took
+> over the Cluster API objects — that run restored both Clusters, every Machine and every cluster CA Secret.
+> The results are in [§3](#3-results).
 > [§4, full recovery](#4-full-recovery-after-losing-the-hypervisor) is **WRITTEN, NEVER EXECUTED**: it is
 > assembled from kubeadm's and Cluster API's documented behaviour and has not been rehearsed.
 
@@ -101,16 +106,33 @@ EOF
 
 ### 2.2 Decrypt (operator, on the machine holding the key)
 
-Streams the encrypted file from `cp`, decrypts it locally, and writes the plaintext over ssh straight
-into the tmpfs — it never lands on a disk on either machine:
+Two steps, each crossing the network once, so either can simply be re-run. The operator's Mac reaches
+`cp` only through a Tailscale DERP relay, and a single pipe that pulls the file down and pushes the
+plaintext straight back up (34 MB through the relay) timed out mid-stream on 2026-11-13 — see
+[Corrections](#corrections).
+
+**1. Fetch the encrypted file.** Safe on disk: it is useless without the key. Check it arrived whole
+against the size and hash on `cp` (`sudo stat -c %s …` and `sudo sha256sum …` there):
 
 ```sh
-ssh cp 'sudo cat /var/lib/hydra-backup/hydra-mgmt/hydra-mgmt-<STAMP>.db.age' \
-  | age -d -i <offline key file> | ssh cp 'umask 077; cat > /run/pet70-drill/mgmt.db'
+ssh cp 'sudo cat /var/lib/hydra-backup/hydra-mgmt/hydra-mgmt-<STAMP>.db.age' > ~/drill.db.age
+stat -f %z ~/drill.db.age; shasum -a 256 ~/drill.db.age     # macOS; must equal cp's values
 ```
 
-Prints nothing on success. `No such file or directory` from the far side means the workspace is gone
-(see the `/dev/shm` note in 2.1).
+**2. Decrypt and push once.** The plaintext goes over ssh straight into the tmpfs and never lands on a
+disk on either machine:
+
+```sh
+age -d -i <offline key file> ~/drill.db.age | ssh cp 'umask 077; cat > /run/pet70-drill/mgmt.db'
+```
+
+Prints nothing on success; delete `~/drill.db.age` afterwards. Before restoring, check on `cp` that
+`stat -c %s /run/pet70-drill/mgmt.db` equals the job log's `bytes before encryption`.
+
+- `No such file or directory` from the far side: the workspace is gone (see the `/dev/shm` note in 2.1).
+- `age: error: failed to decrypt and authenticate payload chunk`: the input was cut short — the
+  connection dropped — not a damaged backup. **A partial plaintext may already be in the tmpfs:**
+  `rm -f /run/pet70-drill/mgmt.db` on `cp`, then repeat this step.
 
 ### 2.3 Restore and serve (on `cp`, no sudo)
 
@@ -157,14 +179,24 @@ for k in namespaces crd nodes "deployments -A" "configmaps -A" "secrets -A" "ser
 done
 ```
 
-For the management cluster, also compare the provider's backend config by hash, never by printing it:
+For the management cluster, also compare the provider's backend config and every cluster's Cluster
+API Secrets by hash, never by printing them:
 
 ```sh
 for o in cm/libvirt-config secret/libvirt-pki; do
   echo "$o restored=$($R -n cluster-api-provider-hydra-system get $o -o json | jq -S .data | sha256sum | cut -c1-12)" \
        "live=$($L -n cluster-api-provider-hydra-system get $o -o json | jq -S .data | sha256sum | cut -c1-12)"
 done
+for c in hydra-mgmt hydra-wl0; do for s in ca etcd sa proxy kubeconfig; do
+  echo "$c-$s restored=$($R -n default get secret $c-$s -o json | jq -S .data | sha256sum | cut -c1-12)" \
+       "live=$($L -n default get secret $c-$s -o json | jq -S .data | sha256sum | cut -c1-12)"
+done; done
 ```
+
+Those Secrets are what §4 rebuilds every control plane from; a restore that loses them restores nothing
+useful. Also check that each HydraMachine still records its owner
+(`hydramachine.infrastructure.cluster.x-k8s.io/owner-uid` equal to its UID) — the hypervisor's owner
+records name those UIDs.
 
 ### 2.5 Tear down (on `cp`, needs sudo for the unmount)
 
@@ -178,7 +210,9 @@ Verify: `pgrep -af "^$D/bin/"` prints nothing, no drill port is listening, and `
 To drill a second cluster first, stop the two processes and `rm -rf $D/etcd-<name>`, then repeat 2.2–2.4
 with the other backup; the same ports are reused.
 
-## 3. Results, 2026-11-10
+## 3. Results
+
+### 3.1 2026-11-10 — both clusters, before the move
 
 Both backups decrypted with the offline key, restored, and served. Nothing of either was left behind
 (processes stopped, ports closed, tmpfs unmounted, `/dev/shm` empty).
@@ -195,11 +229,27 @@ Both backups decrypted with the offline key, restored, and served. Nothing of ei
 | `libvirt-config`, `libvirt-pki` | **hash-equal** to live | n/a |
 | Workload detail | Hydra provider `sha-847066f08e67`; the 3 Hydra CRDs carry the move label | radar Deployment+StatefulSet, 7 Argo CD workloads, 11 Applications — same; PV `radar-postgres-data` `Retain`, path intact |
 
-**What this does not yet prove for the management cluster.** On 2026-11-10 hydra-mgmt's etcd held no
-Cluster API objects — those still lived on `hlcluster` until the PET-74 pivot. Once it holds them
-(after the pivot and the next hourly backup), re-run §2 for hydra-mgmt and add a row: the restored copy
-must list both Clusters, all Machines and HydraMachines, and the `hydra-*-ca` / `-etcd` / `-sa` /
-`-proxy` / `-kubeconfig` Secrets.
+On 2026-11-10 hydra-mgmt's etcd held no Cluster API objects — they still lived on `hlcluster` until the
+PET-74 move — so this run could not prove that a management backup restores them. §3.2 does.
+
+### 3.2 2026-11-13 — hydra-mgmt after the move
+
+`hydra-mgmt-20261113T034016Z.db.age`, taken at 03:40, three minutes after `clusterctl move` brought
+hydra-wl0's and hydra-mgmt's own Cluster API objects onto it. Decrypted in two steps (§2.2) after the
+one-pipe form timed out; the partial plaintext that attempt left in the tmpfs was deleted.
+
+| | hydra-mgmt `…T034016Z` |
+|---|---|
+| Job log | rev 2786674, 703 keys, 17264672 B |
+| Decrypted file / `etcdutl snapshot status` | 17264672 B / rev 2786674, 703 keys, hash `fc3c17fb` |
+| namespaces / CRDs / nodes | 13 / 37 / 3 — **same as live** |
+| Deployments / ConfigMaps / Secrets | 11 / 25 / 29 — **same** |
+| ServiceAccounts / ClusterRoles / webhooks | 65 / 104 / 4 — **same** |
+| Cluster API objects | **2 Clusters** (`hydra-mgmt`, `hydra-wl0`), 8 Machines, 8 HydraMachines (8/8 with `owner-uid` equal to their UID), 2 KCPs, 2 MachineDeployments, 2 HydraClusters, 2 MachineHealthChecks — **same** |
+| Cluster Secrets | `hydra-mgmt-{ca,etcd,sa,proxy,kubeconfig}`, `hydra-wl0-{ca,etcd,sa,proxy,kubeconfig}`, `hydra-wl0-libvirt-pki` — **all hash-equal** to live |
+| `libvirt-config`, `libvirt-pki` | **hash-equal** to live; provider `sha-847066f08e67` |
+
+Torn down as in §2.5: processes stopped, no drill port listening, tmpfs unmounted, `/dev/shm` empty.
 
 ## 4. Full recovery after losing the hypervisor
 
@@ -232,3 +282,11 @@ Open questions to settle in the rehearsal: whether KCP accepts a single survivin
 3-member restore without manual etcd membership surgery; how the provider treats a providerID whose
 domain is absent on a different hypervisor; and the order for hydra-wl0's control plane when its etcd
 must come from its own backup rather than from a surviving member.
+
+## Corrections
+
+- **2026-11-13, §2.2.** The decrypt was a single pipe: `ssh cp 'sudo cat …' | age -d … | ssh cp 'cat > …'`.
+  It worked on 2026-11-10 but timed out mid-stream on 2026-11-13, because the operator's Mac reaches `cp`
+  through a Tailscale DERP relay and the pipe pushed the file through it twice. `age` rejected the cut-off
+  input, and about 12 MB of plaintext had already landed in the tmpfs. §2.2 is now two steps, each
+  re-runnable, and says how to clear a partial file.
