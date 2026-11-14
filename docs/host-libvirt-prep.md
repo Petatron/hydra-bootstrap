@@ -373,6 +373,16 @@ to `vfio-pci`.
 > not come back as a working Kubernetes worker, and debugging that on top of a
 > GPU change is worse than doing them separately.
 >
+> **Update 2026-11-14 (PET-34): all three are resolved.**
+> - `overlay` is now in `k8s.conf`.
+> - The sysctls were never runtime-only: they are persisted in `/etc/sysctl.d/99-kubernetes*.conf`,
+>   and have been since 2026-02-04.
+> - The netplan conflict is fixed.
+>
+> See phase0 [Corrections](./phase0-current-cluster.md#corrections) #10–#11. What has changed is
+> the cost of a reboot: this host now runs **every Hydra VM**, the management cluster hydra-mgmt
+> included, so a reboot stops both clusters. Plan it as a window.
+>
 > **Suggestion: skip Step 4 for now.** Nothing in PET-37 needs GPU passthrough —
 > the first VM-backed pool is a plain test pool. Close PET-31's other criteria,
 > clear PET-34, then come back to this with one reboot that exercises both.

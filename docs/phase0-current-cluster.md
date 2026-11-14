@@ -377,6 +377,13 @@ Netplan merges by ascending filename, so `50-cloud-init.yaml` wins and re-enable
 the bridge's slave interface. That is a latent fault: `enp142s0` may acquire its own lease
 alongside `br0`. The cloud-init file should be neutralised rather than left to race.
 
+> **Fixed 2026-11-14 (PET-34)** — see [Corrections](#corrections) #11. Confirmed first: `netplan get`
+> merged to `enp142s0: dhcp4: true`, and the generated `10-netplan-enp142s0.network` carried both
+> `DHCP=ipv4` and `Bridge=br0`, so networkd sat at `enslaved (configuring)`. `enp142s0` never held a
+> lease of its own. Now `50-cloud-init.yaml` is renamed `50-cloud-init.yaml.disabled-pet34`,
+> cloud-init's network management is off (`/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg`),
+> `01-bridge.yaml` is `0600`, and `enp142s0` is `enslaved (configured)` with no address.
+
 Two spare interfaces are available (`enp141s0`, `wlp143s0`), which matters for giving a relocated
 control plane a dedicated static address without disturbing `br0`.
 
@@ -495,6 +502,8 @@ Entries in earlier revisions of this document that turned out to be wrong, and w
 | 7 | The control plane has no route to `192.168.15.0/24`; `192.168.0.1` is an "upstream router" | The default route reaches the office through **UniFi SD-WAN**; `192.168.0.1` is its tunnel peer (`tracepath` 2026-11-06: path MTU 1420, RTT ≈ 31 ms). SD-WAN carries only networks UniFi defines at each site — a static route at one site is not advertised to the other (PET-75) | Cross-site reachability is set in UniFi, not on the hosts. |
 | 8 | Every workload DNS query crosses the inter-site hop because both CoreDNS replicas sit on the control plane | Since the cluster became the CAPI management cluster, **34 of 41 pods run on `hlcluster-ctrlr0`** (every management controller is pinned there); the two worker VMs carry 7 system pods. CoreDNS on the control plane is next to its clients | PET-32 item 4 needs no change. |
 | 9 | (implicit) the cluster's workers are the bare-metal workstation | The workers are now two **Hydra-managed VMs** (`hydra-md-0-mj9gx-4c6dv` `192.168.15.52`, `hydra-worker-0` `192.168.15.200`); the workstation is a node of `hydra-wl0` instead | Anything in §1 about "the worker" describes the August state. |
+| 10 | The workstation's host prep is a subset of `bootstrap-control-plane.sh`: no persisted modules or sysctls, no `SystemdCgroup`, no package hold ([Open items](#open-items)) | Re-audited 2026-11-14 (PET-34). Module and sysctl persistence existed **since 2026-02-04**, under names the capture did not look for: `/etc/modules-load.d/k8s.conf` (`br_netfilter`), and `/etc/sysctl.d/99-kubernetes.conf` plus `99-kubernetes-cri.conf` (bridge-nf-call-iptables/ip6tables, `ip_forward`). `SystemdCgroup = true` is set in `/etc/containerd/config.toml`, matching kubelet's `cgroupDriver: systemd`; kubeadm, kubelet and kubectl are held at 1.35.3; swap is off. All of it survived the 2026-11-05 boot. The one real gap was `overlay` missing from `k8s.conf`, added 2026-11-14 | Only `overlay`'s load at boot is unproven, until the host's next reboot. |
+| 11 | The netplan conflict is latent | Confirmed and fixed 2026-11-14 (PET-34); see [Network configuration](#network-configuration). Applied with `networkctl reload` and `networkctl reconfigure enp142s0`: `netplan try` refuses whenever a bridge has custom parameters, and reconfiguring only the port left `br0` and its address alone. A 1 s reachability monitor of the host, both VIPs and a hydra-wl0 control-plane node lost **0** packets, and all 8 VMs and both clusters were unchanged | Backups of the previous files are in `/root/pet34-20261114/` on the host. |
 
 ### ADR-004 must be rewritten
 
@@ -531,11 +540,13 @@ Blocked on access to the workstation (`192.168.15.13`), which refuses TCP 22:
       then `kubeadm join`. Note this is a **subset** of `bootstrap-control-plane.sh` — no
       persisted `/etc/modules-load.d/k8s.conf`, no `/etc/sysctl.d/k8s.conf`, no
       `SystemdCgroup = true` edit, no `apt-mark hold`. The worker's prep is less complete than the
-      control plane's and should not be assumed identical.
+      control plane's and should not be assumed identical. **Corrected 2026-11-14**: the persistence
+      existed under other file names; see [Corrections](#corrections) #10.
 - [x] ~~Per-device IOMMU group isolation~~ — **verified clean**: groups 15 / 26 / 38, one GPU each
 - [x] ~~Which API endpoint the workstation's kubelet uses~~ — `https://192.168.16.10:6443`; the
       `.15.10` history belongs to an earlier cluster generation
-- [ ] Neutralise the `50-cloud-init.yaml` / `01-bridge.yaml` netplan conflict
+- [x] ~~Neutralise the `50-cloud-init.yaml` / `01-bridge.yaml` netplan conflict~~ — **done 2026-11-14**
+      (PET-34); see [Corrections](#corrections) #11
 - [ ] Choose a static address (or DNS name) for the relocated control-plane API endpoint
 - [ ] Decide the pod/VM resource split on the workstation
 - [x] ~~Reason sshd is closed, and the intended admin path~~ — **answered**: no machine runs sshd;
